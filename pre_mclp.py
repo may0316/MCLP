@@ -131,8 +131,18 @@ class MocoModel(torch.nn.Module):
 
 import torch.optim as optim
 
-# 加载训练数据
+# 加载训练数据 - 使用向后兼容的函数
+print("正在加载预训练数据...")
 train_dataset = create_more.get_random_data(n_nodes, 2, 0, device)
+print(f"预训练数据集加载完成，包含 {len(train_dataset)} 个实例")
+
+# 或者使用预生成的pretrain_dataset.pkl（如果已存在）
+# try:
+#     train_dataset = create_more.load_dataset('pretrain_dataset.pkl')
+#     print(f"从文件加载预训练数据集，包含 {len(train_dataset)} 个实例")
+# except FileNotFoundError:
+#     print("未找到pretrain_dataset.pkl，使用随机生成的数据")
+#     train_dataset = create_more.get_random_data(n_nodes, 2, 0, device)
 
 model = MocoModel(2, 128, 64, n_nodes).to(device)
 optimizer = optim.Adam(model.q_net.parameters(), lr=0.001, weight_decay=5e-4)
@@ -197,3 +207,4 @@ for epoch in range(200):
             print(f'Model saved with loss {loss:.4f}')
 
 print("Pre-training completed!")
+print(f"最佳模型已保存到 pre_mclp.pth (loss: {loss_fin:.4f})")

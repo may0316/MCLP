@@ -11,6 +11,9 @@ import os
 import create_more
 import pickle
 import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.rcParams['font.sans-serif'] = ['SimHei']  # 黑体，支持中文
+matplotlib.rcParams['axes.unicode_minus'] = False    # 正确显示负号
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 n_nodes = 500
@@ -116,10 +119,48 @@ class MocoModel(torch.nn.Module):
 import torch.optim as optim
 
 device = torch.device('cpu')
-train_dataset = create_more.load_dataset('dataset_800.pkl')
+
+# 加载数据集 - 使用新的数据集格式
+print("正在加载MCLP数据集...")
+try:
+    # 尝试从文件加载dataset_800.pkl
+    train_dataset = create_more.load_dataset('dataset_800.pkl')
+    print(f"成功加载数据集，包含 {len(train_dataset)} 个实例")
+except FileNotFoundError:
+    print("未找到 dataset_800.pkl，正在生成新的数据集...")
+    # 生成新的数据集
+    generator = create_more.MCLPDatasetGenerator(
+        num_nodes=500,
+        dim=2,
+        num_instances=800,
+        coord_range=(0.0, 10.0),
+        device=device
+    )
+    train_dataset = generator.generate_dataset(distribution_type='mixed')
+    create_more.save_dataset(train_dataset, 'dataset_800.pkl')
+    print(f"已生成并保存新的数据集，包含 {len(train_dataset)} 个实例")
+
+# 分析数据集的前几个实例
+print("\n数据集前3个实例的分析:")
+for i in range(min(3, len(train_dataset))):
+    name, points = train_dataset[i]
+    dist_matrix = create_more._pairwise_euclidean(points, points, device)
+    diameter = dist_matrix.max().item()
+    coverage_radius = 0.15 * diameter
+    print(f"  实例 {name}: 直径={diameter:.2f}, 覆盖半径={coverage_radius:.2f}, "
+          f"坐标范围=[{points[:,0].min():.1f},{points[:,0].max():.1f}]x"
+          f"[{points[:,1].min():.1f},{points[:,1].max():.1f}]")
+
+# 加载预训练模型
+print("\n正在加载预训练模型...")
 model = MocoModel(2, 128, 64, n_nodes).to(device)
-model.load_state_dict(torch.load('pre_mclp.pth'))
-K = 50
+try:
+    model.load_state_dict(torch.load('pre_mclp.pth'))
+    print("预训练模型加载成功")
+except FileNotFoundError:
+    print("警告: 未找到 pre_mclp.pth，使用随机初始化的模型")
+
+K = 50  # 要放置的设施数量
 
 
 class MLP(torch.nn.Module):
@@ -273,9 +314,22 @@ def greedy_mclp_rounding(probabilities, K, dist_all, coverage_radius, n_iteratio
     return torch.tensor(best_selection.astype(float)).to(device), best_coverage
 
 
+# 统计所有实例的结果
+all_results = []
+
 # 主训练和求解循环
-for index, (_, points) in enumerate(train_dataset):
+print("\n" + "="*70)
+print("开始MCLP求解")
+print("="*70)
+
+# 可以选择只处理部分实例进行测试
+max_instances_to_process = min(10, len(train_dataset))  # 只处理前10个实例进行测试
+print(f"将处理前 {max_instances_to_process} 个实例")
+
+for index, (instance_name, points) in enumerate(train_dataset[:max_instances_to_process]):
     start = time.time()
+    
+    print(f"\n正在处理实例 {index}: {instance_name}")
     
     # 构建图
     graph, dist_all = create_more.build_graph_from_points(points, None, True, 'euclidean')
@@ -283,8 +337,9 @@ for index, (_, points) in enumerate(train_dataset):
     
     # 设置覆盖半径
     coverage_radius = 0.15 * diameter
-    print(f"\nInstance {index}: diameter={diameter:.4f}, coverage_radius={coverage_radius:.4f}")
-    print(f"Total nodes: {n_nodes}, Facilities to place: {K}")
+    print(f"  直径: {diameter:.4f}")
+    print(f"  覆盖半径: {coverage_radius:.4f} (直径的15%)")
+    print(f"  总节点数: {n_nodes}, 需要放置设施数: {K}")
     
     # 计算度矩阵
     adj_matrix = to_dense_adj(graph.edge_index)
@@ -307,7 +362,7 @@ for index, (_, points) in enumerate(train_dataset):
     patience = 30
     patience_counter = 0
     
-    print("Training MLP...")
+    print("  训练MLP...")
     for t in range(500):
         model_mlp.train()
         
@@ -362,16 +417,16 @@ for index, (_, points) in enumerate(train_dataset):
                 
                 if t % 50 == 0:
                     current_lr = optimizer.param_groups[0]['lr']
-                    print(f"  Iteration {t}: loss={loss.item():.4f}, "
-                          f"coverage={coverage_val}/{n_nodes} ({coverage_percentage:.1f}%), "
-                          f"LR={current_lr:.6f}")
+                    print(f"    迭代 {t}: 损失={loss.item():.4f}, "
+                          f"覆盖率={coverage_val}/{n_nodes} ({coverage_percentage:.1f}%), "
+                          f"学习率={current_lr:.6f}")
                 
                 if patience_counter >= patience:
-                    print(f"  Early stopping at iteration {t}")
+                    print(f"    早停于迭代 {t}")
                     break
     
     # 最终评估
-    print("\nFinal evaluation...")
+    print("  最终评估...")
     model_mlp.eval()
     with torch.no_grad():
         # 加载最佳模型
@@ -403,65 +458,182 @@ for index, (_, points) in enumerate(train_dataset):
             min_facility_dist = torch.min(facility_distances, dim=1)[0].mean().item()
         else:
             min_facility_dist = 0.0
+        
+        # 保存结果
+        instance_result = {
+            'instance_id': index,
+            'instance_name': instance_name,
+            'selected_facilities': selected_indices,
+            'coverage': final_coverage,
+            'coverage_percentage': coverage_percentage,
+            'avg_distance': avg_distance,
+            'max_distance': max_distance,
+            'min_facility_dist': min_facility_dist,
+            'coverage_radius': coverage_radius,
+            'diameter': diameter
+        }
+        all_results.append(instance_result)
     
     end = time.time()
+    elapsed_time = end - start
     
     # 输出结果
-    print(f"\n=== Instance {index} Results ===")
-    print(f"Time elapsed: {end - start:.2f} seconds")
-    print(f"Selected facilities ({len(selected_indices)}): {selected_indices}")
-    print(f"Coverage: {final_coverage}/{n_nodes} nodes ({coverage_percentage:.1f}%)")
-    print(f"Average distance to nearest facility: {avg_distance:.4f}")
-    print(f"Maximum distance to nearest facility: {max_distance:.4f}")
-    print(f"Average distance between facilities: {min_facility_dist:.4f}")
-    print(f"Coverage radius: {coverage_radius:.4f}")
+    print(f"\n=== 实例 {index} ({instance_name}) 结果 ===")
+    print(f"  耗时: {elapsed_time:.2f} 秒")
+    print(f"  选择的设施 ({len(selected_indices)}个): {selected_indices}")
+    print(f"  覆盖率: {final_coverage}/{n_nodes} 节点 ({coverage_percentage:.1f}%)")
+    print(f"  到最近设施的平均距离: {avg_distance:.4f}")
+    print(f"  到最近设施的最大距离: {max_distance:.4f}")
+    print(f"  设施间平均最小距离: {min_facility_dist:.4f}")
+    print(f"  覆盖半径: {coverage_radius:.4f}")
     
-    # 可视化（可选）
-    if index < 3:  # 只可视化前几个实例
-        plt.figure(figsize=(12, 10))
-        points_np = points.cpu().numpy()
-        
-        # 绘制所有节点
-        plt.scatter(points_np[:, 0], points_np[:, 1], c='lightblue', s=20, 
-                   label=f'All Nodes ({n_nodes})', alpha=0.5)
-        
-        # 标记被覆盖的节点
-        covered_indices = torch.where(covered_nodes == 1)[0].cpu().numpy()
-        plt.scatter(points_np[covered_indices, 0], points_np[covered_indices, 1], 
-                   c='green', s=30, label=f'Covered ({len(covered_indices)})', alpha=0.8)
-        
-        # 标记未覆盖的节点
-        uncovered_indices = torch.where(covered_nodes == 0)[0].cpu().numpy()
-        if len(uncovered_indices) > 0:
-            plt.scatter(points_np[uncovered_indices, 0], points_np[uncovered_indices, 1], 
-                       c='red', s=30, label=f'Uncovered ({len(uncovered_indices)})', alpha=0.8)
-        
-        # 标记选择的设施
-        plt.scatter(points_np[selected_indices, 0], points_np[selected_indices, 1], 
-                   c='orange', s=150, marker='*', label=f'Facilities ({len(selected_indices)})', 
-                   edgecolors='black', linewidths=2, zorder=5)
-        
-        # 为每个设施添加编号
-        for i, idx in enumerate(selected_indices):
-            plt.annotate(f'{i+1}', (points_np[idx, 0], points_np[idx, 1]), 
-                        fontsize=10, fontweight='bold', ha='center', va='center', color='black')
-        
-        # 绘制覆盖范围
-        for facility_idx in selected_indices:
-            circle = plt.Circle((points_np[facility_idx, 0], points_np[facility_idx, 1]), 
-                               coverage_radius, color='orange', alpha=0.08, linewidth=1, linestyle='--')
-            plt.gca().add_patch(circle)
-        
-        plt.title(f'MCLP Solution - Instance {index}\nCoverage: {coverage_percentage:.1f}%', fontsize=14)
-        plt.xlabel('X Coordinate', fontsize=12)
-        plt.ylabel('Y Coordinate', fontsize=12)
-        plt.legend(loc='best', fontsize=10)
-        plt.grid(True, alpha=0.3)
-        plt.axis('equal')
-        plt.tight_layout()
-        plt.savefig(f'mclp_solution_{index}.png', dpi=150, bbox_inches='tight')
-        plt.show()
+    # 可视化（只可视化前3个实例）- 修复版
+    if index < 3:
+        try:
+            plt.figure(figsize=(14, 12))
+            points_np = points.cpu().numpy()
+            
+            # 绘制所有节点
+            plt.scatter(points_np[:, 0], points_np[:, 1], c='lightblue', s=30, 
+                       label=f'所有节点 ({n_nodes})', alpha=0.5, edgecolors='white', linewidth=0.5)
+            
+            # 标记被覆盖的节点
+            covered_indices = torch.where(covered_nodes == 1)[0].cpu().numpy()
+            if len(covered_indices) > 0:
+                plt.scatter(points_np[covered_indices, 0], points_np[covered_indices, 1], 
+                           c='green', s=50, label=f'已覆盖 ({len(covered_indices)})', alpha=0.7, 
+                           edgecolors='darkgreen', linewidth=1)
+            
+            # 标记未覆盖的节点
+            uncovered_indices = torch.where(covered_nodes == 0)[0].cpu().numpy()
+            if len(uncovered_indices) > 0:
+                plt.scatter(points_np[uncovered_indices, 0], points_np[uncovered_indices, 1], 
+                           c='red', s=50, label=f'未覆盖 ({len(uncovered_indices)})', alpha=0.7,
+                           edgecolors='darkred', linewidth=1)
+            
+            # 标记选择的设施
+            if len(selected_indices) > 0:
+                plt.scatter(points_np[selected_indices, 0], points_np[selected_indices, 1], 
+                           c='gold', s=300, marker='*', label=f'设施 ({len(selected_indices)})', 
+                           edgecolors='black', linewidths=3, zorder=10)
+                
+                # 为每个设施添加编号
+                for i, idx in enumerate(selected_indices):
+                    plt.annotate(f'{i+1}', (points_np[idx, 0], points_np[idx, 1]), 
+                                fontsize=12, fontweight='bold', ha='center', va='center', 
+                                color='black', bbox=dict(boxstyle="circle,pad=0.2", 
+                                                        facecolor='white', 
+                                                        edgecolor='black', 
+                                                        alpha=0.8))
+            
+            # 绘制覆盖范围
+            if len(selected_indices) > 0:
+                for facility_idx in selected_indices:
+                    circle = plt.Circle((points_np[facility_idx, 0], points_np[facility_idx, 1]), 
+                                       coverage_radius, color='orange', alpha=0.1, 
+                                       linewidth=2, linestyle='-', edgecolor='orange', zorder=5)
+                    plt.gca().add_patch(circle)
+            
+            plt.title(f'MCLP解决方案 - 实例 {index}: {instance_name}\n'
+                     f'覆盖率: {coverage_percentage:.1f}% | 覆盖半径: {coverage_radius:.2f} | '
+                     f'设施数量: {len(selected_indices)}', 
+                     fontsize=16, fontweight='bold', pad=20)
+            
+            plt.xlabel('X 坐标', fontsize=14)
+            plt.ylabel('Y 坐标', fontsize=14)
+            
+            # 设置图例
+            plt.legend(loc='upper right', fontsize=12, framealpha=0.9)
+            
+            # 添加网格
+            plt.grid(True, alpha=0.3, linestyle='--')
+            
+            # 设置坐标轴范围
+            x_min, x_max = points_np[:, 0].min(), points_np[:, 0].max()
+            y_min, y_max = points_np[:, 1].min(), points_np[:, 1].max()
+            x_margin = (x_max - x_min) * 0.1
+            y_margin = (y_max - y_min) * 0.1
+            plt.xlim(x_min - x_margin, x_max + x_margin)
+            plt.ylim(y_min - y_margin, y_max + y_margin)
+            
+            # 设置纵横比相等
+            plt.gca().set_aspect('equal', adjustable='box')
+            
+            # 添加信息文本框
+            info_text = f'节点总数: {n_nodes}\n'
+            info_text += f'设施数量: {len(selected_indices)}\n'
+            info_text += f'覆盖节点: {final_coverage}\n'
+            info_text += f'覆盖率: {coverage_percentage:.1f}%\n'
+            info_text += f'平均距离: {avg_distance:.3f}\n'
+            info_text += f'最大距离: {max_distance:.3f}\n'
+            info_text += f'覆盖半径: {coverage_radius:.3f}'
+            
+            plt.text(0.02, 0.98, info_text, transform=plt.gca().transAxes,
+                    fontsize=10, verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            
+            plt.tight_layout()
+            
+            # 保存图像
+            plt.savefig(f'mclp_solution_{index}.png', dpi=300, bbox_inches='tight', facecolor='white')
+            
+            # 显示图像
+            plt.show()
+            
+            print(f"  已保存可视化图像: mclp_solution_{index}.png")
+            
+        except Exception as e:
+            print(f"  可视化生成失败: {e}")
+            # 简单备份可视化
+            plt.figure(figsize=(10, 8))
+            points_np = points.cpu().numpy()
+            plt.scatter(points_np[:, 0], points_np[:, 1], s=20, alpha=0.5)
+            if len(selected_indices) > 0:
+                plt.scatter(points_np[selected_indices, 0], points_np[selected_indices, 1], 
+                           s=100, marker='*', c='red')
+            plt.title(f'MCLP Solution {index}: {coverage_percentage:.1f}% coverage')
+            plt.savefig(f'mclp_solution_simple_{index}.png')
+            plt.close()
     
-    print("=" * 50 + "\n")
+    print("="*70)
 
-print("MCLP solving completed!")
+# 输出总体统计
+print("\n" + "="*70)
+print("MCLP求解完成 - 总体统计")
+print("="*70)
+
+if all_results:
+    total_coverage = sum(r['coverage'] for r in all_results)
+    avg_coverage_percentage = sum(r['coverage_percentage'] for r in all_results) / len(all_results)
+    avg_avg_distance = sum(r['avg_distance'] for r in all_results) / len(all_results)
+    
+    print(f"处理的实例数量: {len(all_results)}")
+    print(f"平均覆盖率: {avg_coverage_percentage:.1f}%")
+    print(f"总覆盖节点数: {total_coverage}")
+    print(f"平均到最近设施距离: {avg_avg_distance:.4f}")
+    
+    # 显示每个实例的简要结果
+    print("\n各实例详细结果:")
+    for result in all_results:
+        print(f"  实例 {result['instance_id']} ({result['instance_name']}): "
+              f"{result['coverage']}/{n_nodes} ({result['coverage_percentage']:.1f}%)")
+    
+    # 保存结果到文件
+    results_summary = {
+        'all_results': all_results,
+        'summary': {
+            'num_instances': len(all_results),
+            'avg_coverage_percentage': avg_coverage_percentage,
+            'total_coverage': total_coverage,
+            'avg_avg_distance': avg_avg_distance,
+            'K': K,
+            'n_nodes': n_nodes
+        }
+    }
+    
+    with open('mclp_results_summary.pkl', 'wb') as f:
+        pickle.dump(results_summary, f)
+    
+    print(f"\n详细结果已保存到: mclp_results_summary.pkl")
+
+print("\nMCLP求解完成!")
