@@ -48,20 +48,22 @@ def _pairwise_cosine(data1, data2, device=torch.device('cpu')):
     cosine_dis = 1 - cosine.sum(dim=-1).squeeze(-1)
     return cosine_dis
 
-# ========== MCLP数据集生成器 ==========
+# ========== MCLP数据集生成器（增强版） ==========
 class MCLPDatasetGenerator:
-    """MCLP数据集生成器，模拟北京六环内的地理空间特征"""
+    """MCLP数据集生成器，特别针对文旅场景优化"""
     
     def __init__(self, 
-                 num_nodes: int = 500,
+                 num_nodes: int = 200,
                  dim: int = 2,
-                 num_instances: int = 800,
+                 num_instances: int = 100,
                  coord_range: Tuple[float, float] = (0.0, 100.0),
                  device: torch.device = torch.device('cpu'),
                  include_population_data: bool = True,
                  include_road_network: bool = True,
+                 include_tourism_features: bool = True,
                  generate_regions: bool = True,
-                 urban_ratio: float = 0.6):
+                 urban_ratio: float = 0.6,
+                 tourism_hotspots: int = 8):
         self.num_nodes = num_nodes
         self.dim = dim
         self.num_instances = num_instances
@@ -70,85 +72,158 @@ class MCLPDatasetGenerator:
         self.device = device
         self.include_population_data = include_population_data
         self.include_road_network = include_road_network
+        self.include_tourism_features = include_tourism_features
         self.generate_regions = generate_regions
         self.urban_ratio = urban_ratio
-        
-    def generate_beijing_like_distribution(self):
-        """生成模拟北京六环内分布的点"""
-        # 简化版本：生成随机点，但加入一些聚集效果
+        self.tourism_hotspots = tourism_hotspots
+    def generate_tourism_distribution(self):
+        """生成文旅场景分布：景点、道路、休息区"""
         n = self.num_nodes
         
-        # 生成几个聚集中心
-        centers = []
-        for _ in range(5):
-            center = torch.tensor([
+        # 生成景点热点
+        hotspots = []
+        for _ in range(self.tourism_hotspots):
+            hotspot = torch.tensor([
                 self.min_val + torch.rand(1).item() * self.range_size,
                 self.min_val + torch.rand(1).item() * self.range_size
             ], device=self.device)
-            centers.append(center)
+            hotspots.append(hotspot)
         
         points_list = []
         labels_list = []
+        tourism_features_list = []
         
-        # 为每个中心生成点
-        points_per_center = n // len(centers)
-        for i, center in enumerate(centers):
-            # 生成围绕中心的点
-            cluster_points = center + torch.randn(points_per_center, 2, device=self.device) * (self.range_size * 0.1)
+        # 确保总节点数为num_nodes
+        total_generated = 0
+        
+        # 为每个热点生成点（景点区域）
+        points_per_hotspot = max(1, n // (len(hotspots) * 2))
+        for i, hotspot in enumerate(hotspots):
+            if total_generated >= n:
+                break
+                
+            # 景点区域：密度较高
+            n_cluster = min(points_per_hotspot, n - total_generated)
+            cluster_points = hotspot + torch.randn(n_cluster, 2, device=self.device) * (self.range_size * 0.05)
             cluster_points = torch.clamp(cluster_points, self.min_val, self.max_val)
             points_list.append(cluster_points)
-            labels_list.append(torch.ones(points_per_center, device=self.device, dtype=torch.long) * (i + 1))
+            labels_list.append(torch.ones(n_cluster, device=self.device, dtype=torch.long) * (i + 1))
+            total_generated += n_cluster
+            
+            # 景点特征：高热度
+            features = torch.ones(n_cluster, 3, device=self.device)
+            features[:, 0] = 0.8 + torch.rand(n_cluster, device=self.device) * 0.2  # 景点热度
+            features[:, 1] = 0.6 + torch.rand(n_cluster, device=self.device) * 0.4  # 交通便利度
+            features[:, 2] = 0.7 + torch.rand(n_cluster, device=self.device) * 0.3  # 设施需求度
+            tourism_features_list.append(features)
         
-        # 生成一些随机点
-        remaining = n - len(points_list) * points_per_center
-        if remaining > 0:
-            random_points = torch.rand(remaining, 2, device=self.device) * self.range_size + self.min_val
-            points_list.append(random_points)
-            labels_list.append(torch.zeros(remaining, device=self.device, dtype=torch.long))
+        # 生成道路连接线
+        if total_generated < n:
+            n_road = min(n // 4, n - total_generated)
+            road_points = []
+            
+            for _ in range(3):  # 3条主要道路
+                if len(road_points) >= n_road:
+                    break
+                    
+                p1 = torch.tensor([self.min_val + torch.rand(1).item() * self.range_size,
+                                self.min_val + torch.rand(1).item() * self.range_size], device=self.device)
+                p2 = torch.tensor([self.min_val + torch.rand(1).item() * self.range_size,
+                                self.min_val + torch.rand(1).item() * self.range_size], device=self.device)
+                
+                # 沿道路生成点
+                n_points_per_road = max(1, n_road // 3)
+                for t in torch.linspace(0, 1, n_points_per_road):
+                    point = p1 * (1 - t) + p2 * t
+                    noise = torch.randn(2, device=self.device) * (self.range_size * 0.02)
+                    road_points.append(point + noise)
+            
+            if road_points:
+                n_actual = min(len(road_points), n - total_generated)
+                road_points_tensor = torch.stack(road_points[:n_actual])
+                road_points_tensor = torch.clamp(road_points_tensor, self.min_val, self.max_val)
+                points_list.append(road_points_tensor)
+                labels_list.append(torch.zeros(n_actual, device=self.device, dtype=torch.long))
+                total_generated += n_actual
+                
+                # 道路特征：高交通便利度
+                features = torch.ones(n_actual, 3, device=self.device)
+                features[:, 0] = 0.3 + torch.rand(n_actual, device=self.device) * 0.3
+                features[:, 1] = 0.8 + torch.rand(n_actual, device=self.device) * 0.2
+                features[:, 2] = 0.5 + torch.rand(n_actual, device=self.device) * 0.3
+                tourism_features_list.append(features)
         
-        # 合并所有点
+        # 生成一般区域（填充剩余点）
+        if total_generated < n:
+            n_general = n - total_generated
+            general_points = torch.rand(n_general, 2, device=self.device) * self.range_size + self.min_val
+            points_list.append(general_points)
+            labels_list.append(torch.ones(n_general, device=self.device, dtype=torch.long) * -1)
+            
+            # 一般区域特征
+            features = torch.ones(n_general, 3, device=self.device)
+            features[:, 0] = torch.rand(n_general, device=self.device) * 0.4
+            features[:, 1] = 0.3 + torch.rand(n_general, device=self.device) * 0.4
+            features[:, 2] = 0.3 + torch.rand(n_general, device=self.device) * 0.4
+            tourism_features_list.append(features)
+            total_generated += n_general
+        
+        # 合并
         points = torch.cat(points_list, dim=0)
         labels = torch.cat(labels_list, dim=0)
+        tourism_features = torch.cat(tourism_features_list, dim=0)
+        
+        # 确保节点数正确
+        assert len(points) == n, f"节点数不一致: {len(points)} != {n}"
         
         # 打乱
         indices = torch.randperm(len(points), device=self.device)
         points = points[indices]
         labels = labels[indices]
+        tourism_features = tourism_features[indices]
         
-        return points, labels
+        return points, labels, tourism_features
     
-    def generate_population_weights(self, points, labels=None):
-        """生成人口密度权重"""
+    def generate_population_weights(self, points, labels=None, tourism_features=None):
+        """生成人口密度权重（文旅场景优化）"""
         n = len(points)
-        # 生成基础权重
-        weights = torch.rand(n, device=self.device) * 0.7 + 0.1  # 范围[0.1, 0.8]
+        weights = torch.ones(n, device=self.device) * 0.3  # 基础权重
+        
+        # 如果有旅游特征，使用景点热度
+        if tourism_features is not None:
+            weights += tourism_features[:, 0] * 0.4  # 景点热度贡献
+            weights += tourism_features[:, 2] * 0.3  # 设施需求度贡献
         
         # 如果有标签，调整权重
         if labels is not None:
-            for i in range(1, 6):  # 假设有5个类别
+            for i in range(1, self.tourism_hotspots + 1):
                 mask = (labels == i)
                 if mask.any():
-                    weights[mask] = weights[mask] * (1 + i * 0.1)  # 类别越高权重越高
+                    weights[mask] = weights[mask] * 1.5  # 景点区域权重更高
         
-        # 归一化到[0, 0.9]
-        weights = torch.clamp(weights / weights.max() * 0.9, 0, 0.9)
+        # 归一化到[0.1, 0.9]
+        weights = torch.clamp(weights, 0.1, 0.9)
+        if weights.max() > weights.min():
+            weights = (weights - weights.min()) / (weights.max() - weights.min()) * 0.8 + 0.1
+        
         return weights
     
-    def generate_road_weights(self, points, labels=None):
+    def generate_road_weights(self, points, labels=None, tourism_features=None):
         """生成道路可达性权重"""
         n = len(points)
-        weights = torch.rand(n, device=self.device) * 0.08 + 0.01  # 范围[0.01, 0.09]
+        weights = torch.ones(n, device=self.device) * 0.2
         
-        # 添加一些道路网络效果
-        # 模拟几条主干道
+        # 如果有旅游特征，使用交通便利度
+        if tourism_features is not None:
+            weights += tourism_features[:, 1] * 0.5  # 交通便利度贡献
+        
+        # 添加道路网络效果
         for _ in range(3):
-            # 随机直线
             p1 = torch.tensor([self.min_val + torch.rand(1).item() * self.range_size,
                               self.min_val + torch.rand(1).item() * self.range_size], device=self.device)
             p2 = torch.tensor([self.min_val + torch.rand(1).item() * self.range_size,
                               self.min_val + torch.rand(1).item() * self.range_size], device=self.device)
             
-            # 计算点到直线的距离
             line_vec = p2 - p1
             line_len = torch.norm(line_vec)
             if line_len > 0:
@@ -159,18 +234,20 @@ class MCLPDatasetGenerator:
                 nearest_points = p1 + proj_len.unsqueeze(1) * line_vec
                 dist = torch.norm(points - nearest_points, dim=1)
                 
-                # 距离越近权重越高
-                road_weight = torch.exp(-dist / (self.range_size * 0.1)) * 0.02
+                road_weight = torch.exp(-dist / (self.range_size * 0.05)) * 0.2
                 weights += road_weight
         
-        # 归一化到[0, 0.1]
-        weights = torch.clamp(weights / weights.max() * 0.1, 0, 0.1)
+        # 归一化
+        weights = torch.clamp(weights, 0.1, 0.9)
+        if weights.max() > weights.min():
+            weights = (weights - weights.min()) / (weights.max() - weights.min()) * 0.8 + 0.1
+        
         return weights
     
     def generate_regions_labels(self, points):
         """生成区域标签"""
         points_np = points.cpu().numpy()
-        n_regions = min(6, len(points) // 10)  # 确保有足够点
+        n_regions = min(8, len(points) // 20)
         kmeans = KMeans(n_clusters=n_regions, random_state=42, n_init=10)
         region_labels = kmeans.fit_predict(points_np)
         return torch.tensor(region_labels, device=self.device)
@@ -181,28 +258,33 @@ class MCLPDatasetGenerator:
         torch.random.manual_seed(seed)
         np.random.seed(seed)
         
-        # 1. 生成空间点分布
-        points, spatial_labels = self.generate_beijing_like_distribution()
+        # 1. 生成文旅场景分布
+        points, spatial_labels, tourism_features = self.generate_tourism_distribution()
         
         # 2. 生成权重数据
         population_weights = None
         road_weights = None
         
         if self.include_population_data:
-            population_weights = self.generate_population_weights(points, spatial_labels)
+            population_weights = self.generate_population_weights(points, spatial_labels, tourism_features)
         
         if self.include_road_network:
-            road_weights = self.generate_road_weights(points, spatial_labels)
+            road_weights = self.generate_road_weights(points, spatial_labels, tourism_features)
         
-        # 3. 计算总权重
-        if population_weights is not None and road_weights is not None:
-            total_weights = population_weights + road_weights
-        elif population_weights is not None:
-            total_weights = population_weights
-        elif road_weights is not None:
-            total_weights = road_weights
-        else:
-            total_weights = torch.ones(len(points), device=self.device) * 0.5
+        # 3. 计算总权重（文旅场景加权）
+        total_weights = torch.ones(len(points), device=self.device) * 0.5
+        
+        if population_weights is not None:
+            total_weights = total_weights * 0.3 + population_weights * 0.4
+        
+        if road_weights is not None:
+            total_weights = total_weights + road_weights * 0.3
+        
+        if tourism_features is not None:
+            total_weights = total_weights + tourism_features[:, 2] * 0.4  # 设施需求度
+        
+        # 归一化总权重
+        total_weights = torch.clamp(total_weights, 0.1, 1.0)
         
         # 4. 生成区域标签
         region_labels = None
@@ -212,23 +294,25 @@ class MCLPDatasetGenerator:
         # 5. 计算距离矩阵
         distance_matrix = _pairwise_euclidean(points, points, self.device)
         
-        # 6. 计算覆盖半径
-        diameter = distance_matrix.max().item()
-        coverage_radius = diameter * 0.15
+        # 6. 计算覆盖半径（基于文旅场景调整）
+        avg_dist = distance_matrix[distance_matrix > 0].mean().item()
+        coverage_radius = avg_dist * 0.25  # 更合理的覆盖半径
         
         # 7. 构建实例信息
         instance_info = {
-            'name': f'mclp_beijing_{instance_id:04d}',
+            'name': f'mclp_tourism_{instance_id:04d}',
             'instance_id': instance_id,
             'points': points,
             'spatial_labels': spatial_labels,
+            'tourism_features': tourism_features,
             'population_weights': population_weights,
             'road_weights': road_weights,
             'total_weights': total_weights,
             'region_labels': region_labels,
             'distance_matrix': distance_matrix,
             'coverage_radius': coverage_radius,
-            'diameter': diameter,
+            'avg_distance': avg_dist,
+            'diameter': distance_matrix.max().item(),
             'num_nodes': len(points),
             'generation_time': time.time()
         }
@@ -239,8 +323,8 @@ class MCLPDatasetGenerator:
         """生成完整的数据集"""
         dataset = []
         
-        print(f"正在生成MCLP数据集...")
-        print(f"参数: 节点数={self.num_nodes}, 实例数={self.num_instances}")
+        print(f"正在生成文旅MCLP数据集...")
+        print(f"参数: 节点数={self.num_nodes}, 实例数={self.num_instances}, 景点数={self.tourism_hotspots}")
         print("-" * 60)
         
         start_time = time.time()
@@ -259,9 +343,9 @@ class MCLPDatasetGenerator:
         
         return dataset
 
-# ========== 图构建函数 ==========
+# ========== 图构建函数（优化版） ==========
 def build_mclp_graph(instance, graph_threshold=None, distance_metric='euclidean'):
-    """为MCLP问题构建图"""
+    """为MCLP问题构建图（增强特征）"""
     points = instance['points']
     
     # 使用预计算的距离矩阵或重新计算
@@ -271,20 +355,25 @@ def build_mclp_graph(instance, graph_threshold=None, distance_metric='euclidean'
         dist_func = _get_distance_func(distance_metric)
         dist = dist_func(points, points, points.device)
     
-    # 确定图构建阈值
+    # 确定图构建阈值（基于文旅场景）
     if graph_threshold is None:
-        diameter = dist.max().item()
-        graph_threshold = diameter * 0.05
+        avg_dist = dist[dist > 0].mean().item()
+        graph_threshold = avg_dist * 0.3
     
-    # 构建边
-    edge_indices = torch.nonzero(dist <= graph_threshold, as_tuple=False).transpose(0, 1)
+    # 构建边（双向连接）
+    edge_mask = dist <= graph_threshold
+    edge_indices = torch.nonzero(edge_mask, as_tuple=False).t()
     
-    # 计算边权重
-    edge_attrs = dist[edge_indices[0], edge_indices[1]]
-    edge_attrs = 1.0 / (edge_attrs + 1e-6)
+    # 计算边权重（距离的倒数，归一化）
+    edge_dists = dist[edge_indices[0], edge_indices[1]]
+    edge_attrs = 1.0 / (edge_dists + 1e-6)
+    edge_attrs = edge_attrs / edge_attrs.max() if edge_attrs.max() > 0 else edge_attrs
     
-    # 构建节点特征
+    # 构建节点特征（增强）
     node_features_list = [points]
+    
+    if instance.get('tourism_features') is not None:
+        node_features_list.append(instance['tourism_features'])
     
     if instance.get('population_weights') is not None:
         node_features_list.append(instance['population_weights'].unsqueeze(1))
@@ -297,8 +386,20 @@ def build_mclp_graph(instance, graph_threshold=None, distance_metric='euclidean'
     
     node_features = torch.cat(node_features_list, dim=1)
     
-    # 计算距离行的和
+    # 计算节点重要性特征
     dist_row_sum = torch.sum(dist, dim=1, keepdim=True)
+    dist_row_norm = dist_row_sum / dist_row_sum.max() if dist_row_sum.max() > 0 else dist_row_sum
+    
+    # 计算度数特征
+    if edge_indices.shape[1] > 0:
+        degree = torch.zeros(len(points), dtype=torch.long, device=points.device)
+        unique, counts = torch.unique(edge_indices[0], return_counts=True)
+        degree[unique] = counts
+        degree = degree.float().unsqueeze(1)
+        degree_norm = degree / degree.max() if degree.max() > 0 else degree
+    else:
+        degree = torch.ones(len(points), 1, device=points.device)
+        degree_norm = degree
     
     # 创建图数据对象
     graph_data = pyg.data.Data(
@@ -306,16 +407,19 @@ def build_mclp_graph(instance, graph_threshold=None, distance_metric='euclidean'
         edge_index=edge_indices,
         edge_attr=edge_attrs.unsqueeze(1),
         pos=points,
-        dist_row_sum=dist_row_sum,
+        dist_row_sum=dist_row_norm,
+        degree=degree_norm,
+        tourism_features=instance.get('tourism_features'),
         population_weights=instance.get('population_weights'),
         road_weights=instance.get('road_weights'),
         total_weights=instance.get('total_weights'),
         spatial_labels=instance.get('spatial_labels'),
         region_labels=instance.get('region_labels'),
         distance_matrix=dist,
-        coverage_radius=instance.get('coverage_radius', graph_threshold * 3),
+        coverage_radius=instance.get('coverage_radius', graph_threshold * 2),
         graph_threshold=graph_threshold,
         diameter=dist.max().item(),
+        avg_distance=instance.get('avg_distance', dist[dist > 0].mean().item()),
         instance_name=instance['name'],
         instance_id=instance['instance_id']
     )
@@ -355,40 +459,27 @@ def analyze_dataset(dataset, max_instances_to_analyze=3):
     
     print(f"数据集包含 {len(dataset)} 个实例")
     for i, instance in enumerate(dataset[:max_instances_to_analyze]):
-        print(f"实例 {i}: {instance['name']}, 节点数: {len(instance['points'])}")
-
-def get_random_data(num_data, dim, seed, device, num_instances=1):
-    """生成随机数据"""
-    torch.random.manual_seed(seed)
-    dataset = []
-    
-    for i in range(num_instances):
-        points = torch.rand(num_data, dim, device=device)
-        dataset.append({
-            'name': f'rand_{i:04d}',
-            'instance_id': i,
-            'points': points,
-            'num_nodes': num_data,
-            'distance_matrix': _pairwise_euclidean(points, points, device),
-            'total_weights': torch.ones(num_data, device=device) * 0.5
-        })
-    
-    return dataset
+        print(f"实例 {i}: {instance['name']}, 节点数: {len(instance['points'])}, 覆盖半径: {instance.get('coverage_radius', 'N/A'):.2f}")
 
 # ========== 主程序 ==========
 if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"使用设备: {device}")
     
-    # 生成测试数据集
-    print("\n生成测试数据集...")
+    # 生成文旅场景数据集
+    print("\n生成文旅MCLP数据集...")
     test_generator = MCLPDatasetGenerator(
         num_nodes=200,
         num_instances=50,
-        device=device
+        device=device,
+        include_tourism_features=True,
+        tourism_hotspots=8
     )
     
     test_dataset = test_generator.generate_dataset()
-    save_dataset(test_dataset, 'mclp_beijing_test_50.pkl')
+    save_dataset(test_dataset, 'mclp_tourism_test_50.pkl')
+    
+    # 分析数据集
+    analyze_dataset(test_dataset)
     
     print("\n数据集生成完成！")

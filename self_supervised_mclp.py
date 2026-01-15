@@ -1,314 +1,334 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch_geometric
 from torch_geometric.nn import GCNConv
 import numpy as np
 import copy
 
-class SelfSupervisedMCLPWrapper:
-    """自监督MCLP包装器，可以无缝集成到现有框架"""
+class GCNEncoder(nn.Module):
+    """GCN编码器（借鉴FLP架构）"""
+    def __init__(self, in_channels, hidden_channels, out_channels):
+        super(GCNEncoder, self).__init__()
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, out_channels)
+        
+        self.bn1 = nn.BatchNorm1d(hidden_channels)
+        self.bn2 = nn.BatchNorm1d(out_channels)
+        
+        # 节点特征增强（类似FLP）
+        self.fc_dist = nn.Linear(1, out_channels)
+        self.fc_degree = nn.Linear(1, out_channels)
+        self.fc_merge = nn.Linear(3 * out_channels, out_channels)
+        
+        self.bn_dist = nn.BatchNorm1d(out_channels)
+        self.bn_degree = nn.BatchNorm1d(out_channels)
+        
+    def forward(self, x, edge_index, edge_weight, dist_feat, degree_feat):
+        # GCN编码
+        x_gcn = self.conv1(x, edge_index, edge_weight)
+        x_gcn = F.relu(self.bn1(x_gcn))
+        x_gcn = self.conv2(x_gcn, edge_index, edge_weight)
+        x_gcn = self.bn2(x_gcn)
+        x_gcn = F.relu(x_gcn)
+        
+        # 距离特征处理
+        dist_feat = self.fc_dist(dist_feat)
+        dist_feat = self.bn_dist(dist_feat)
+        dist_feat = F.relu(dist_feat)
+        
+        # 度数特征处理
+        degree_feat = self.fc_degree(degree_feat)
+        degree_feat = self.bn_degree(degree_feat)
+        degree_feat = F.relu(degree_feat)
+        
+        # 特征融合
+        x_concat = torch.cat((x_gcn, dist_feat, degree_feat), dim=1)
+        x_concat = self.fc_merge(x_concat)
+        
+        return x_concat
+
+class MoCoMCLPModel(nn.Module):
+    """基于MoCo的MCLP自监督模型（借鉴FLP）"""
+    def __init__(self, dim_in, dim_hidden, dim_out, m=0.99, K=512):
+        super().__init__()
+        self.m = m
+        self.K = K
+        
+        # Query network
+        self.q_net = GCNEncoder(dim_in, dim_hidden, dim_out)
+        
+        # Key network
+        self.k_net = GCNEncoder(dim_in, dim_hidden, dim_out)
+        
+        # 初始化key网络参数
+        for param_q, param_k in zip(self.q_net.parameters(), self.k_net.parameters()):
+            param_k.data.copy_(param_q.data)
+            param_k.requires_grad = False
+        
+        # 创建队列（对比学习）
+        self.register_buffer("queue", torch.randn(dim_out, K))
+        self.queue = F.normalize(self.queue, dim=0)
+        
+        # 创建权重队列（用于MCLP任务）
+        self.register_buffer("queue_weights", torch.randn(K, 3))  # [热度, 交通, 需求]
+        
+        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+        
+        # MCLP任务头
+        self.facility_head = nn.Sequential(
+            nn.Linear(dim_out, dim_hidden // 2),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(dim_hidden // 2, 1)
+        )
+        
+        # 覆盖预测头
+        self.coverage_head = nn.Sequential(
+            nn.Linear(dim_out, dim_hidden // 2),
+            nn.ReLU(),
+            nn.Linear(dim_hidden // 2, 1),
+            nn.Sigmoid()
+        )
     
-    def __init__(self, device='cpu', use_tourism_features=False):
+    def forward(self, idx, x, edge_index, edge_weight, dist_feat, degree_feat, batch_size):
+        """前向传播"""
+        # 计算query嵌入
+        embs_q = self.q_net(x, edge_index, edge_weight, dist_feat, degree_feat)
+        embs_q = F.normalize(embs_q, dim=1)
+        
+        if batch_size >= x.shape[0]:
+            # 返回完整嵌入用于推理
+            facility_logits = self.facility_head(embs_q)
+            coverage_probs = self.coverage_head(embs_q)
+            return embs_q, facility_logits, coverage_probs
+        
+        # 提取当前batch
+        q = embs_q[idx * batch_size:(idx + 1) * batch_size, :]
+        
+        # 计算key嵌入（动量更新）
+        with torch.no_grad():
+            self._momentum_update_key_encoder()
+            embs_k = self.k_net(x, edge_index, edge_weight, dist_feat, degree_feat)
+            embs_k = F.normalize(embs_k, dim=1)
+            k = embs_k[idx * batch_size:(idx + 1) * batch_size, :]
+        
+        # 正样本对比
+        l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
+        
+        # 负样本对比（从队列中）
+        l_neg = torch.einsum('nc,ck->nk', [q, self.queue.clone().detach()])
+        
+        # 组合logits
+        logits = torch.cat([l_pos, l_neg], dim=1)
+        logits /= 0.07  # 温度参数
+        
+        labels = torch.zeros(logits.shape[0], dtype=torch.long).to(x.device)
+        
+        # 更新队列
+        self._dequeue_and_enqueue(k)
+        
+        # MCLP任务输出
+        facility_logits = self.facility_head(embs_q)
+        coverage_probs = self.coverage_head(embs_q)
+        
+        return embs_q, facility_logits, coverage_probs, logits, labels
+    
+    @torch.no_grad()
+    def _momentum_update_key_encoder(self):
+        """动量更新key编码器"""
+        for param_q, param_k in zip(self.q_net.parameters(), self.k_net.parameters()):
+            param_k.data = param_k.data * self.m + param_q.data * (1.0 - self.m)
+    
+    @torch.no_grad()
+    def _dequeue_and_enqueue(self, keys):
+        """更新队列"""
+        batch_size = keys.shape[0]
+        ptr = int(self.queue_ptr)
+        
+        # 替换队列中的key
+        self.queue[:, ptr:ptr + batch_size] = keys.T
+        ptr = (ptr + batch_size) % self.K
+        
+        self.queue_ptr[0] = ptr
+    
+    def predict_facilities(self, x, edge_index, edge_weight, dist_feat, degree_feat, K):
+        """预测设施位置"""
+        self.eval()
+        with torch.no_grad():
+            embs_q, facility_logits, coverage_probs = self.forward(
+                0, x, edge_index, edge_weight, dist_feat, degree_feat, x.shape[0]
+            )
+            
+            # 结合设施logits和覆盖概率
+            scores = torch.sigmoid(facility_logits).squeeze() * coverage_probs.squeeze()
+            
+            # 选择得分最高的K个节点
+            selected_indices = torch.topk(scores, min(K, len(scores))).indices
+            
+        return selected_indices.cpu().numpy(), scores.cpu().numpy()
+
+class SelfSupervisedMCLPWrapper:
+    """自监督MCLP包装器"""
+    
+    def __init__(self, device='cpu'):
         self.device = torch.device(device)
         self.model = None
         self.optimizer = None
-        self.use_tourism_features = use_tourism_features
         
-    def initialize_model(self, input_dim, hidden_dim=64, output_dim=32):
+    def initialize_model(self, input_dim, hidden_dim=128, output_dim=64):
         """初始化模型"""
-        self.model = SelfSupervisedMCLPModel(
-            input_dim=input_dim,
-            hidden_dim=hidden_dim,
-            output_dim=output_dim
+        self.model = MoCoMCLPModel(
+            dim_in=input_dim,
+            dim_hidden=hidden_dim,
+            dim_out=output_dim,
+            m=0.99,
+            K=1024
         ).to(self.device)
         
         self.optimizer = torch.optim.Adam(
-            self.model.parameters(), 
+            self.model.parameters(),
             lr=0.001,
-            weight_decay=1e-4
+            weight_decay=5e-4
         )
         
         return self.model
     
-    def train_on_instance(self, instance, epochs=20, graph_builder=None):
-        """在单个实例上进行自监督训练"""
+    def train_on_instance(self, graph, epochs=100, batch_size=32):
+        """在单个图实例上训练"""
         if self.model is None:
-            # 简单估算输入维度
-            if self.use_tourism_features:
-                input_dim = 8  # 坐标(2) + 地形(3) + 权重(3)
-            else:
-                input_dim = 5  # 坐标(2) + 权重(3)
+            input_dim = graph.x.shape[1]
             self.initialize_model(input_dim)
         
-        # 将实例转换为图
-        graph = self._instance_to_graph(instance, graph_builder)
-        
-        # 自监督训练
-        losses = []
         self.model.train()
+        losses = []
+        
+        # 准备数据
+        x = graph.x.to(self.device).float()
+        edge_index = graph.edge_index.to(self.device).long()
+        edge_weight = graph.edge_attr.to(self.device).float() if graph.edge_attr is not None else None
+        dist_feat = graph.dist_row_sum.to(self.device).float() if hasattr(graph, 'dist_row_sum') else torch.ones(x.shape[0], 1, device=self.device)
+        degree_feat = graph.degree.to(self.device).float() if hasattr(graph, 'degree') else torch.ones(x.shape[0], 1, device=self.device)
+        
+        n_nodes = x.shape[0]
+        num_batches = max(1, n_nodes // batch_size)
         
         for epoch in range(epochs):
-            try:
-                # 创建增强视图
-                views = self._create_augmented_views(graph, n_views=2)
-                
-                # 前向传播
-                orig_emb, orig_logits = self.model(
-                    graph.x, graph.edge_index, graph.edge_attr
-                )
-                
-                # 对比损失
-                contrastive_loss = 0
-                for view in views:
-                    view_emb, _ = self.model(view.x, view.edge_index, view.edge_attr)
-                    contrastive_loss += self._compute_contrastive_loss(orig_emb, view_emb)
-                contrastive_loss /= len(views)
-                
-                # MCLP预训练任务损失
-                task_loss = self._compute_pretext_task_loss(graph, orig_emb, K=10)
-                
-                # 总损失
-                total_loss = contrastive_loss + 0.5 * task_loss
-                
-                # 反向传播
-                self.optimizer.zero_grad()
-                total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.optimizer.step()
-                
-                losses.append(total_loss.item())
-                
-                if epoch % 5 == 0:
-                    print(f"    Epoch {epoch}: Loss={total_loss.item():.4f}")
+            epoch_loss = 0
+            num_batches_processed = 0
+            
+            # 数据增强：节点重排（类似FLP）
+            perm = torch.randperm(n_nodes)
+            x_aug = x[perm]
+            
+            # 重新计算edge_index
+            if edge_index.shape[1] > 0:
+                edge_index_aug = perm[edge_index]
+            else:
+                edge_index_aug = edge_index
+            
+            for batch_idx in range(num_batches):
+                try:
+                    # 前向传播
+                    embs_q, facility_logits, coverage_probs, logits, labels = self.model(
+                        batch_idx, x_aug, edge_index_aug, edge_weight,
+                        dist_feat[perm], degree_feat[perm], batch_size
+                    )
                     
-            except Exception as e:
-                print(f"    Epoch {epoch} 失败: {e}")
-                continue
+                    # 对比损失
+                    contrastive_loss = F.cross_entropy(logits, labels)
+                    
+                    # MCLP任务损失
+                    # 1. 设施分布损失（鼓励均匀分布）
+                    facility_probs = torch.sigmoid(facility_logits).squeeze()
+                    facility_dist_loss = -torch.std(facility_probs)  # 鼓励多样性
+                    
+                    # 2. 覆盖质量损失
+                    if hasattr(graph, 'distance_matrix'):
+                        dist_matrix = graph.distance_matrix.to(self.device)
+                        coverage_radius = getattr(graph, 'coverage_radius', dist_matrix.max() * 0.15)
+                        
+                        # 模拟覆盖计算
+                        coverage_loss = self._compute_coverage_loss(
+                            facility_probs, dist_matrix, coverage_radius
+                        )
+                    else:
+                        coverage_loss = torch.tensor(0.0, device=self.device)
+                    
+                    # 总损失
+                    total_loss = contrastive_loss + 0.3 * facility_dist_loss + 0.5 * coverage_loss
+                    
+                    # 反向传播
+                    self.optimizer.zero_grad()
+                    total_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    self.optimizer.step()
+                    
+                    epoch_loss += total_loss.item()
+                    num_batches_processed += 1
+                    
+                except Exception as e:
+                    print(f"Batch {batch_idx} failed: {e}")
+                    continue
+            
+            if num_batches_processed > 0:
+                avg_loss = epoch_loss / num_batches_processed
+                losses.append(avg_loss)
+                
+                if epoch % 10 == 0:
+                    print(f"Epoch {epoch}: Loss={avg_loss:.4f}")
         
         return losses
     
-    def solve_mclp(self, instance, K, graph_builder=None):
-        """使用训练好的模型求解MCLP"""
-        self.model.eval()
+    def _compute_coverage_loss(self, facility_probs, dist_matrix, coverage_radius, K=10):
+        """计算覆盖损失"""
+        n = len(facility_probs)
         
-        # 将实例转换为图
-        graph = self._instance_to_graph(instance, graph_builder)
+        # 选择概率最高的K个节点作为候选设施
+        _, candidate_indices = torch.topk(facility_probs, min(K, n))
         
-        with torch.no_grad():
-            # 获取嵌入和设施概率
-            embeddings, facility_logits = self.model(
-                graph.x, graph.edge_index, graph.edge_attr
-            )
-            
-            # 获取设施选择概率
-            facility_probs = torch.sigmoid(facility_logits).squeeze()
-            
-            # 选择概率最高的K个节点
-            selected_indices = torch.topk(facility_probs, min(K, len(facility_probs))).indices.cpu().numpy()
-            
-            # 计算覆盖率
-            coverage = self._compute_coverage(instance, selected_indices)
+        # 计算每个节点的最小距离
+        dist_to_candidates = dist_matrix[:, candidate_indices]
+        min_dist = torch.min(dist_to_candidates, dim=1)[0]
         
-        return selected_indices, coverage
+        # 计算覆盖概率（距离越近，覆盖概率越高）
+        coverage_probs = torch.exp(-min_dist / coverage_radius)
+        
+        # 损失：鼓励高覆盖
+        coverage_loss = -torch.mean(coverage_probs)
+        
+        return coverage_loss
     
-    def _instance_to_graph(self, instance, graph_builder=None):
-        """将实例转换为图数据"""
-        if graph_builder is not None:
-            graph = graph_builder(instance)
-        else:
-            # 使用create_more中的build_mclp_graph
-            from create_more import build_mclp_graph
-            graph = build_mclp_graph(instance)
+    def solve_mclp(self, graph, K, batch_size=32):
+        """求解MCLP问题"""
+        if self.model is None:
+            raise ValueError("Model not initialized. Call initialize_model() first.")
         
-        # 确保数据类型正确
-        graph.x = graph.x.float().to(self.device)
-        if graph.edge_attr is not None:
-            graph.edge_attr = graph.edge_attr.float().to(self.device)
+        # 准备数据
+        x = graph.x.to(self.device).float()
+        edge_index = graph.edge_index.to(self.device).long()
+        edge_weight = graph.edge_attr.to(self.device).float() if graph.edge_attr is not None else None
+        dist_feat = graph.dist_row_sum.to(self.device).float() if hasattr(graph, 'dist_row_sum') else torch.ones(x.shape[0], 1, device=self.device)
+        degree_feat = graph.degree.to(self.device).float() if hasattr(graph, 'degree') else torch.ones(x.shape[0], 1, device=self.device)
         
-        # 确保edge_index是long类型
-        graph.edge_index = graph.edge_index.long()
-        
-        return graph
-    
-    def _create_augmented_views(self, graph, n_views=2):
-        """创建增强视图 - 修复版本"""
-        views = []
-        
-        for _ in range(n_views):
-            # 克隆图
-            aug_graph = graph.clone()
-            
-            # 1. 特征噪声
-            if torch.rand(1).item() < 0.5:
-                noise = torch.randn_like(aug_graph.x) * 0.1
-                aug_graph.x = aug_graph.x + noise
-            
-            # 2. 边丢弃 - 修复：确保数据类型正确
-            if torch.rand(1).item() < 0.3 and aug_graph.edge_index.shape[1] > 0:
-                num_edges = aug_graph.edge_index.shape[1]
-                keep_probs = torch.ones(num_edges) * 0.9
-                keep_mask = torch.rand(num_edges) < keep_probs
-                keep_mask = keep_mask.bool()  # 确保是bool类型
-                
-                if keep_mask.sum() > 0:
-                    aug_graph.edge_index = aug_graph.edge_index[:, keep_mask]
-                    if aug_graph.edge_attr is not None:
-                        aug_graph.edge_attr = aug_graph.edge_attr[keep_mask]
-            
-            # 3. 节点特征掩码 - 修复：确保mask是bool类型
-            if torch.rand(1).item() < 0.3:
-                # 创建bool类型的掩码
-                mask = torch.rand_like(aug_graph.x) > 0.8
-                mask = mask.bool()  # 显式转换为bool类型
-                aug_graph.x[mask] = 0
-            
-            views.append(aug_graph)
-        
-        return views
-    
-    def _compute_contrastive_loss(self, emb1, emb2):
-        """计算对比损失"""
-        # 归一化嵌入
-        emb1 = F.normalize(emb1, dim=1)
-        emb2 = F.normalize(emb2, dim=1)
-        
-        # 计算相似度矩阵
-        similarity = torch.matmul(emb1, emb2.T)
-        
-        # 温度参数
-        temperature = 0.1
-        
-        # 对角线是正样本
-        batch_size = emb1.shape[0]
-        labels = torch.arange(batch_size).to(self.device).long()
-        
-        # InfoNCE损失
-        loss = F.cross_entropy(similarity / temperature, labels)
-        
-        return loss
-    
-    def _compute_pretext_task_loss(self, graph, embeddings, K):
-        """计算预训练任务损失"""
-        num_nodes = embeddings.shape[0]
-        
-        # 生成伪标签：基于度数选择设施
-        with torch.no_grad():
-            # 计算节点度数
-            if hasattr(graph, 'edge_index') and graph.edge_index is not None:
-                # 从edge_index计算度数
-                if graph.edge_index.shape[1] > 0:
-                    degree = torch.zeros(num_nodes, device=self.device)
-                    unique, counts = torch.unique(graph.edge_index[0], return_counts=True)
-                    degree[unique] = counts.float()
-                else:
-                    degree = torch.ones(num_nodes, device=self.device)
-            else:
-                degree = torch.ones(num_nodes, device=self.device)
-            
-            # 选择度数最高的K个节点作为"伪设施"
-            pseudo_facilities = torch.zeros(num_nodes, device=self.device)
-            if num_nodes > 0:
-                _, top_indices = torch.topk(degree, min(K, num_nodes))
-                pseudo_facilities[top_indices] = 1
-        
-        # 预测哪些节点是设施
-        facility_pred = self.model.facility_head(embeddings).squeeze()
-        task_loss = F.binary_cross_entropy_with_logits(
-            facility_pred, pseudo_facilities
+        # 预测设施
+        selected_indices, scores = self.model.predict_facilities(
+            x, edge_index, edge_weight, dist_feat, degree_feat, K
         )
         
-        return task_loss
-    
-    def _compute_coverage(self, instance, selected_indices):
-        """计算覆盖率"""
-        from create_more import _pairwise_euclidean
-        
-        points = instance['points'].to(self.device)
-        
-        # 计算距离矩阵
-        dist_matrix = _pairwise_euclidean(points, points, self.device)
-        
-        # 获取覆盖半径
-        coverage_radius = instance.get('coverage_radius', dist_matrix.max().item() * 0.15)
-        
-        # 计算覆盖
-        if len(selected_indices) > 0:
-            selected_indices_tensor = torch.tensor(selected_indices, device=self.device)
-            dist_to_selected = dist_matrix[:, selected_indices_tensor]
-            min_dist = torch.min(dist_to_selected, dim=1)[0]
-            covered_mask = (min_dist <= coverage_radius)
+        # 计算覆盖率
+        if hasattr(graph, 'distance_matrix') and hasattr(graph, 'coverage_radius'):
+            dist_matrix = graph.distance_matrix
+            coverage_radius = graph.coverage_radius
             
-            if 'total_weights' in instance and instance['total_weights'] is not None:
-                total_weights = instance['total_weights'].to(self.device)
-                coverage = torch.sum(total_weights[covered_mask]).item()
-            else:
+            # 计算实际覆盖
+            if len(selected_indices) > 0:
+                dist_to_selected = dist_matrix[:, selected_indices]
+                min_dist = torch.min(dist_to_selected, dim=1)[0]
+                covered_mask = (min_dist <= coverage_radius)
                 coverage = torch.sum(covered_mask.float()).item()
+            else:
+                coverage = 0
         else:
-            coverage = 0
+            coverage = len(selected_indices) * 10  # 估计值
         
-        return coverage
-
-
-class SelfSupervisedMCLPModel(nn.Module):
-    """自监督MCLP模型"""
-    
-    def __init__(self, input_dim, hidden_dim=64, output_dim=32):
-        super().__init__()
-        
-        # GNN编码器
-        self.gnn_encoder = GNNEncoder(
-            input_dim=input_dim,
-            hidden_dim=hidden_dim,
-            output_dim=output_dim
-        )
-        
-        # 设施预测头
-        self.facility_head = nn.Sequential(
-            nn.Linear(output_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim // 2, 1)
-        )
-        
-    def forward(self, x, edge_index, edge_weight=None):
-        # GNN编码
-        embeddings = self.gnn_encoder(x, edge_index, edge_weight)
-        
-        # 设施预测
-        facility_logits = self.facility_head(embeddings)
-        
-        return embeddings, facility_logits
-
-
-class GNNEncoder(nn.Module):
-    """GNN编码器"""
-    
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super().__init__()
-        
-        self.conv1 = GCNConv(input_dim, hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, hidden_dim)
-        self.conv3 = GCNConv(hidden_dim, output_dim)
-        
-        self.bn1 = nn.BatchNorm1d(hidden_dim)
-        self.bn2 = nn.BatchNorm1d(hidden_dim)
-        
-    def forward(self, x, edge_index, edge_weight=None):
-        # 确保edge_index是long类型
-        if edge_index is not None:
-            edge_index = edge_index.long()
-        
-        x = self.conv1(x, edge_index, edge_weight)
-        x = self.bn1(x)
-        x = F.relu(x)
-        x = F.dropout(x, p=0.2, training=self.training)
-        
-        x = self.conv2(x, edge_index, edge_weight)
-        x = self.bn2(x)
-        x = F.relu(x)
-        x = F.dropout(x, p=0.2, training=self.training)
-        
-        x = self.conv3(x, edge_index, edge_weight)
-        
-        return x
+        return selected_indices, coverage, scores
