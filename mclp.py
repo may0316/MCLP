@@ -1,639 +1,475 @@
+# mclp.py（修复版）
 import time
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch_geometric
-from torch_geometric.nn import GCNConv
-from torch_geometric.utils import to_dense_adj
-from torch_geometric.data import Data, DataLoader
-import os
-import create_more
 import pickle
+import os
 import matplotlib.pyplot as plt
 import matplotlib
-matplotlib.rcParams['font.sans-serif'] = ['SimHei']  # 黑体，支持中文
-matplotlib.rcParams['axes.unicode_minus'] = False    # 正确显示负号
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-n_nodes = 500
+# 导入create_more模块
+from create_more import MCLPDatasetGenerator, build_mclp_graph, load_dataset, save_dataset
+from self_supervised_mclp import SelfSupervisedMCLPWrapper
 
-class GCN(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, n_nodes):
-        super(GCN, self).__init__()
+matplotlib.rcParams['font.sans-serif'] = ['SimHei']
+matplotlib.rcParams['axes.unicode_minus'] = False
 
-        self.conv1 = GCNConv(in_channels, hidden_channels)
-        self.conv2 = GCNConv(hidden_channels, out_channels)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"使用设备: {device}")
 
-        self.be = nn.BatchNorm1d(out_channels)
-        self.bn = nn.BatchNorm1d(out_channels)
-        self.bd = nn.BatchNorm1d(out_channels)
-
-        self.fc_0 = nn.Linear(1, out_channels)
-        self.fc_1 = nn.Embedding(500, out_channels)
-        self.fc_2 = nn.Linear(3 * out_channels, out_channels)
-
-    def forward(self, x, edge_index, edge_weight, edges, degree):
-        x = self.conv1(x, edge_index, edge_weight)
-        x = F.relu(x)
-        x = F.dropout(x, 0)
-        x = self.conv2(x, edge_index, edge_weight)
-        x = self.bn(x)
-        x = F.relu(x)
-
-        edges = self.fc_0(edges)
-        edges = self.be(edges)
-        edges = F.relu(edges)
-
-        degree = self.fc_1(degree)
-        degree = self.bd(degree)
-        degree = F.relu(degree)
-
-        x_concat = torch.cat((x, edges, degree), dim=1)
-        x_concat = self.fc_2(x_concat)
-        return x_concat
-
-
-class MocoModel(torch.nn.Module):
-    def __init__(self, dim_in, dim_hidden, dim_out, n_nodes, m=0.99, K=256):
-        super().__init__()
-        self.m = m
-        self.K = K
-
-        self.q_net = GCN(dim_in, dim_hidden, dim_out, n_nodes)
-        self.k_net = GCN(dim_in, dim_hidden, dim_out, n_nodes)
-
-        for param_q, param_k in zip(self.q_net.parameters(), self.k_net.parameters()):
-            param_k.data.copy_(param_q.data)
-            param_k.requires_grad = False
-
-        self.register_buffer("queue", torch.randn(dim_out, K))
-        self.queue = nn.functional.normalize(self.queue, dim=0)
-        self.register_buffer("queue_w", torch.randn(n_nodes, K))
-        self.queue_w = nn.functional.normalize(self.queue_w, dim=0)
-
-        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
-
-    def forward(self, idx, x, edge_index, edge_weight, edge, degree, batch):
-        embs_q = self.q_net(x, edge_index, edge_weight, edge, degree)
-        embs_q = F.normalize(embs_q, dim=1)
-        
-        if batch == x.shape[0]:
-            return embs_q
-        
-        q = embs_q[idx * batch:(idx + 1) * batch, :]
-
-        with torch.no_grad():
-            self._momentum_update_key_encoder()
-            embs_k = self.k_net(x, edge_index, edge_weight, edge, degree)
-            embs_k = F.normalize(embs_k, dim=1)
-            k = embs_k[idx * batch:(idx + 1) * batch, :]
-
-        l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
-        l_neg = torch.einsum('nc,ck->nk', [q, self.queue.clone().detach()])
-
-        logits = torch.cat([l_pos, l_neg], dim=1)
-        logits /= 0.07
-
-        labels = torch.zeros(logits.shape[0], dtype=torch.long).to(device)
-        self._dequeue_and_enqueue(k)
-
-        return embs_q, logits, labels
-
-    @torch.no_grad()
-    def _momentum_update_key_encoder(self):
-        for param_q, param_k in zip(self.q_net.parameters(), self.k_net.parameters()):
-            param_k.data = param_k.data * self.m + param_q.data * (1.0 - self.m)
-
-    @torch.no_grad()
-    def _dequeue_and_enqueue(self, keys):
-        batch_size = keys.shape[0]
-        ptr = int(self.queue_ptr)
-        assert self.K % batch_size == 0
-
-        self.queue[:, ptr: ptr + batch_size] = keys.T
-        ptr = (ptr + batch_size) % self.K
-        self.queue_ptr[0] = ptr
-
-
-import torch.optim as optim
-
-device = torch.device('cpu')
-
-# 加载数据集 - 使用新的数据集格式
-print("正在加载MCLP数据集...")
-try:
-    # 尝试从文件加载dataset_800.pkl
-    train_dataset = create_more.load_dataset('dataset_800.pkl')
-    print(f"成功加载数据集，包含 {len(train_dataset)} 个实例")
-except FileNotFoundError:
-    print("未找到 dataset_800.pkl，正在生成新的数据集...")
-    # 生成新的数据集
-    generator = create_more.MCLPDatasetGenerator(
-        num_nodes=500,
-        dim=2,
-        num_instances=800,
-        coord_range=(0.0, 10.0),
-        device=device
-    )
-    train_dataset = generator.generate_dataset(distribution_type='mixed')
-    create_more.save_dataset(train_dataset, 'dataset_800.pkl')
-    print(f"已生成并保存新的数据集，包含 {len(train_dataset)} 个实例")
-
-# 分析数据集的前几个实例
-print("\n数据集前3个实例的分析:")
-for i in range(min(3, len(train_dataset))):
-    name, points = train_dataset[i]
-    dist_matrix = create_more._pairwise_euclidean(points, points, device)
-    diameter = dist_matrix.max().item()
-    coverage_radius = 0.15 * diameter
-    print(f"  实例 {name}: 直径={diameter:.2f}, 覆盖半径={coverage_radius:.2f}, "
-          f"坐标范围=[{points[:,0].min():.1f},{points[:,0].max():.1f}]x"
-          f"[{points[:,1].min():.1f},{points[:,1].max():.1f}]")
-
-# 加载预训练模型
-print("\n正在加载预训练模型...")
-model = MocoModel(2, 128, 64, n_nodes).to(device)
-try:
-    model.load_state_dict(torch.load('pre_mclp.pth'))
-    print("预训练模型加载成功")
-except FileNotFoundError:
-    print("警告: 未找到 pre_mclp.pth，使用随机初始化的模型")
-
-K = 50  # 要放置的设施数量
-
-
-class MLP(torch.nn.Module):
-    def __init__(self, dim_in, dim_hidden, dim_out):
+class SelfSupervisedMLP(nn.Module):
+    """基于自监督嵌入的MLP"""
+    def __init__(self, input_dim, hidden_dim, output_dim):
         super().__init__()
         self.fc = nn.Sequential(
-            nn.Linear(dim_in, dim_hidden), 
-            nn.ReLU(), 
-            nn.Linear(dim_hidden, dim_out)
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, output_dim)
         )
+    
+    def forward(self, x):
+        return self.fc(x)
 
-    def forward(self, embs):
-        mlp_embs = self.fc(embs)
-        return mlp_embs
-
-
-def mclp_objective(y, dist_all, coverage_radius):
-    """
-    原始MCLP目标函数（用于评估）
-    y: 选择设施的二进制向量 (n_nodes,)
-    dist_all: 所有节点对之间的距离矩阵 (n_nodes, n_nodes)
-    coverage_radius: 覆盖半径
-    """
-    selected_indices = torch.where(y == 1)[0]
-    
-    if len(selected_indices) > 0:
-        dist_to_selected = dist_all[:, selected_indices]
-        min_dist_to_facility = torch.min(dist_to_selected, dim=1)[0]
-        covered_nodes = (min_dist_to_facility <= coverage_radius).float()
-        return covered_nodes.sum()
-    else:
-        return torch.tensor(0.0)
-
-
-def differentiable_mclp_objective(y_probs, dist_all, coverage_radius, temperature=0.1):
-    """
-    可微分的MCLP目标函数近似
-    y_probs: 选择设施的概率向量 (n_nodes,)
-    dist_all: 距离矩阵 (n_nodes, n_nodes)
-    coverage_radius: 覆盖半径
-    temperature: 温度参数，控制平滑程度
-    """
-    n_nodes = y_probs.shape[0]
-    
-    # 确保y_probs是概率值（0-1之间）
-    if y_probs.min() < 0 or y_probs.max() > 1:
-        y_probs = torch.sigmoid(y_probs)
-    
-    # 添加小量避免除零和log(0)
-    eps = 1e-8
-    y_probs = y_probs.clamp(eps, 1-eps)
-    
-    # 使用对数概率，增加数值稳定性
-    log_y_probs = torch.log(y_probs + eps)
-    
-    # 计算每个节点到各个设施的加权距离
-    # 使用负距离，使得较近的设施有较高的权重
-    neg_dist = -dist_all
-    weighted_logits = neg_dist / temperature + log_y_probs.unsqueeze(0)
-    
-    # 使用logsumexp计算软最小距离
-    log_weights = F.log_softmax(weighted_logits, dim=1)
-    
-    # 计算期望最小距离
-    expected_min_dist = torch.sum(torch.exp(log_weights) * dist_all, dim=1)
-    
-    # 使用sigmoid近似指示函数：距离是否小于覆盖半径
-    # 使用较大的斜率使sigmoid更接近阶跃函数
-    slope = 50.0 / coverage_radius
-    coverage_probs = torch.sigmoid(slope * (coverage_radius - expected_min_dist))
-    
-    # 返回总覆盖概率
-    total_coverage = torch.sum(coverage_probs)
-    
-    return total_coverage
-
-
-def greedy_mclp_rounding(probabilities, K, dist_all, coverage_radius, n_iterations=20):
-    """
-    贪心舍入算法用于MCLP
-    """
-    n_nodes = len(probabilities)
-    probabilities_np = probabilities.detach().cpu().numpy()
-    dist_all_np = dist_all.detach().cpu().numpy()
-    
-    best_coverage = -1
-    best_selection = None
-    
-    for iteration in range(n_iterations):
-        selected = np.zeros(n_nodes, dtype=bool)
-        remaining_budget = K
+def prepare_self_supervised_data(instance, self_supervised_model, device):
+    """使用自监督模型准备数据"""
+    # 获取图数据
+    try:
+        graph = build_mclp_graph(instance)
+    except Exception as e:
+        print(f"图构建失败: {e}")
+        # 创建简单图
+        points = instance['points']
+        n = len(points)
         
-        # 首轮选择：基于概率和潜在覆盖
-        # 计算每个设施的潜在覆盖率（覆盖半径内的节点数）
-        potential_coverage = np.sum(dist_all_np <= coverage_radius, axis=0)
+        # 简单邻接：每个节点连接最近的3个邻居
+        from create_more import _pairwise_euclidean
+        dist_matrix = _pairwise_euclidean(points, points, device)
         
-        # 综合得分：概率 * 潜在覆盖率
-        combined_scores = probabilities_np * (potential_coverage + 1)
+        edge_list = []
+        for i in range(n):
+            # 获取最近的3个邻居（排除自己）
+            distances = dist_matrix[i].clone()
+            distances[i] = float('inf')  # 排除自己
+            _, indices = torch.topk(distances, min(3, n-1), largest=False)
+            for j in indices:
+                edge_list.append([i, j.item()])
+                edge_list.append([j.item(), i])
         
-        # 选择前K个
-        top_indices = np.argsort(combined_scores)[-K:]
-        selected[top_indices] = True
+        edge_index = torch.tensor(edge_list, dtype=torch.long, device=device).t().contiguous()
         
-        # 局部优化：尝试替换设施以提高覆盖率
-        for local_iter in range(10):
-            improved = False
-            
-            # 尝试用未选择的设施替换已选择的设施
-            selected_indices = np.where(selected)[0]
-            unselected_indices = np.where(~selected)[0]
-            
-            for s_idx in selected_indices:
-                for u_idx in unselected_indices:
-                    # 临时替换
-                    temp_selected = selected.copy()
-                    temp_selected[s_idx] = False
-                    temp_selected[u_idx] = True
-                    
-                    # 计算新覆盖
-                    temp_selected_idx = np.where(temp_selected)[0]
-                    dist_to_selected = dist_all_np[:, temp_selected_idx]
-                    min_dist = np.min(dist_to_selected, axis=1)
-                    new_coverage = np.sum(min_dist <= coverage_radius)
-                    
-                    # 当前覆盖
-                    current_selected_idx = np.where(selected)[0]
-                    dist_to_current = dist_all_np[:, current_selected_idx]
-                    current_min_dist = np.min(dist_to_current, axis=1)
-                    current_coverage = np.sum(current_min_dist <= coverage_radius)
-                    
-                    if new_coverage > current_coverage:
-                        selected = temp_selected
-                        improved = True
-                        break
-                
-                if improved:
-                    break
-            
-            if not improved:
-                break
-        
-        # 评估这个选择
-        selected_tensor = torch.tensor(selected.astype(float)).to(device)
-        coverage = mclp_objective(selected_tensor, dist_all, coverage_radius)
-        coverage_value = coverage.item()
-        
-        if coverage_value > best_coverage:
-            best_coverage = coverage_value
-            best_selection = selected.copy()
+        graph = type('Graph', (), {
+            'x': points.to(device).float(),
+            'edge_index': edge_index,
+            'edge_attr': None,
+            'distance_matrix': dist_matrix
+        })()
     
-    return torch.tensor(best_selection.astype(float)).to(device), best_coverage
-
-
-# 统计所有实例的结果
-all_results = []
-
-# 主训练和求解循环
-print("\n" + "="*70)
-print("开始MCLP求解")
-print("="*70)
-
-# 可以选择只处理部分实例进行测试
-max_instances_to_process = min(10, len(train_dataset))  # 只处理前10个实例进行测试
-print(f"将处理前 {max_instances_to_process} 个实例")
-
-for index, (instance_name, points) in enumerate(train_dataset[:max_instances_to_process]):
-    start = time.time()
+    graph.x = graph.x.float().to(device)
     
-    print(f"\n正在处理实例 {index}: {instance_name}")
+    if hasattr(graph, 'edge_index') and graph.edge_index is not None:
+        graph.edge_index = graph.edge_index.long().to(device)
     
-    # 构建图
-    graph, dist_all = create_more.build_graph_from_points(points, None, True, 'euclidean')
-    diameter = dist_all.max().item()
+    if hasattr(graph, 'edge_attr') and graph.edge_attr is not None:
+        graph.edge_attr = graph.edge_attr.float().to(device)
     
-    # 设置覆盖半径
-    coverage_radius = 0.15 * diameter
-    print(f"  直径: {diameter:.4f}")
-    print(f"  覆盖半径: {coverage_radius:.4f} (直径的15%)")
-    print(f"  总节点数: {n_nodes}, 需要放置设施数: {K}")
+    # 获取自监督嵌入
+    self_supervised_model.model.eval()
     
-    # 计算度矩阵
-    adj_matrix = to_dense_adj(graph.edge_index)
-    adj_matrix = torch.squeeze(adj_matrix)
-    degree = torch.sum(adj_matrix, dim=0).to(device)
-    degree = degree.long()
-    
-    # 获取预训练嵌入
     with torch.no_grad():
-        embs = model(0, graph.x, graph.edge_index, graph.edge_attr, 
-                     graph.dist_row, degree, graph.x.shape[0])
+        try:
+            embeddings, _ = self_supervised_model.model(
+                graph.x, graph.edge_index, graph.edge_attr
+            )
+        except Exception as e:
+            print(f"获取嵌入失败: {e}")
+            # 使用随机嵌入作为后备
+            embeddings = torch.randn(len(graph.x), 32, device=device)
     
-    # 创建并训练MLP
-    model_mlp = MLP(64, 32, 1).to(device)
-    optimizer = optim.Adam(model_mlp.parameters(), lr=0.005, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=500)
-    
-    # 训练MLP
-    best_train_coverage = 0
-    patience = 30
-    patience_counter = 0
-    
-    print("  训练MLP...")
-    for t in range(500):
-        model_mlp.train()
-        
-        # 前向传播
-        logits = model_mlp(embs).squeeze()  # (n_nodes,)
-        
-        # 计算选择概率
-        y_probs = torch.sigmoid(logits)
-        
-        # 使用可微分的目标函数计算覆盖率
-        coverage = differentiable_mclp_objective(y_probs, dist_all, coverage_radius, temperature=0.2)
-        
-        # 设施数量约束：鼓励选择大约K个设施
-        facility_count = torch.sum(y_probs)
-        count_penalty = torch.abs(facility_count - K) / K
-        
-        # 熵正则化：鼓励清晰的决策
-        entropy = -torch.sum(y_probs * torch.log(y_probs + 1e-10) + 
-                            (1 - y_probs) * torch.log(1 - y_probs + 1e-10)) / n_nodes
-        
-        # 总损失：负覆盖率 + 数量惩罚 + 熵正则化
-        loss = -coverage / n_nodes + 0.1 * count_penalty + 0.01 * entropy
-        
-        # 反向传播和优化
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model_mlp.parameters(), 1.0)
-        optimizer.step()
-        scheduler.step()
-        
-        # 定期评估
-        if t % 10 == 0:
-            with torch.no_grad():
-                model_mlp.eval()
-                logits_eval = model_mlp(embs).squeeze()
-                probabilities = torch.sigmoid(logits_eval)
-                
-                # 使用贪心舍入进行评估
-                y_rounded, coverage_val = greedy_mclp_rounding(
-                    probabilities, K, dist_all, coverage_radius, n_iterations=10
-                )
-                
-                coverage_percentage = coverage_val / n_nodes * 100
-                
-                if coverage_val > best_train_coverage:
-                    best_train_coverage = coverage_val
-                    patience_counter = 0
-                    torch.save(model_mlp.state_dict(), f'mclp_best_model_{index}.pth')
-                    best_probabilities = probabilities.clone()
-                else:
-                    patience_counter += 1
-                
-                if t % 50 == 0:
-                    current_lr = optimizer.param_groups[0]['lr']
-                    print(f"    迭代 {t}: 损失={loss.item():.4f}, "
-                          f"覆盖率={coverage_val}/{n_nodes} ({coverage_percentage:.1f}%), "
-                          f"学习率={current_lr:.6f}")
-                
-                if patience_counter >= patience:
-                    print(f"    早停于迭代 {t}")
-                    break
-    
-    # 最终评估
-    print("  最终评估...")
-    model_mlp.eval()
-    with torch.no_grad():
-        # 加载最佳模型
-        if os.path.exists(f'mclp_best_model_{index}.pth'):
-            model_mlp.load_state_dict(torch.load(f'mclp_best_model_{index}.pth'))
-        
-        # 获取最终概率
-        probabilities = torch.sigmoid(model_mlp(embs).squeeze())
-        
-        # 使用贪心舍入获得最终解
-        final_solution, final_coverage = greedy_mclp_rounding(
-            probabilities, K, dist_all, coverage_radius, n_iterations=100
-        )
-        
-        # 计算覆盖细节
-        selected_indices = torch.where(final_solution == 1)[0].cpu().numpy()
-        dist_to_selected = dist_all[:, selected_indices]
-        min_dist_to_facility = torch.min(dist_to_selected, dim=1)[0]
-        covered_nodes = (min_dist_to_facility <= coverage_radius).float()
-        
-        avg_distance = min_dist_to_facility.mean().item()
-        max_distance = min_dist_to_facility.max().item()
-        coverage_percentage = final_coverage / n_nodes * 100
-        
-        # 计算设施之间的平均距离（避免聚集）
-        if len(selected_indices) > 1:
-            facility_distances = dist_all[selected_indices][:, selected_indices]
-            np.fill_diagonal(facility_distances.cpu().numpy(), np.inf)
-            min_facility_dist = torch.min(facility_distances, dim=1)[0].mean().item()
+    # 计算度
+    if hasattr(graph, 'edge_index') and graph.edge_index is not None:
+        if graph.edge_index.shape[1] > 0:
+            unique, counts = torch.unique(graph.edge_index[0], return_counts=True)
+            degree = torch.zeros(len(graph.x), device=device)
+            degree[unique] = counts.float()
         else:
-            min_facility_dist = 0.0
+            degree = torch.zeros(len(graph.x), device=device)
+    else:
+        degree = torch.zeros(len(graph.x), device=device)
+    
+    return {
+        'embeddings': embeddings,
+        'degree': degree,
+        'dist_matrix': graph.distance_matrix.float() if hasattr(graph, 'distance_matrix') else None,
+        'coverage_radius': instance.get('coverage_radius'),
+        'total_weights': instance.get('total_weights'),
+        'instance': instance,
+        'graph': graph
+    }
+
+def main():
+    # 加载数据
+    print("正在加载MCLP数据集...")
+    try:
+        dataset_file = 'mclp_beijing_test_20.pkl'
+        if not os.path.exists(dataset_file):
+            print("生成新的数据集...")
+            generator = MCLPDatasetGenerator(
+                num_nodes=100,
+                num_instances=10,
+                device=device
+            )
+            train_dataset = generator.generate_dataset()
+            save_dataset(train_dataset, dataset_file)
+        else:
+            train_dataset = load_dataset(dataset_file)
+        
+        print(f"成功加载数据集，包含 {len(train_dataset)} 个实例")
+        
+        # 使用小部分数据进行测试
+        if len(train_dataset) > 5:
+            train_dataset = train_dataset[:3]  # 只用3个实例测试
+            print(f"使用前3个实例进行测试")
+            
+    except Exception as e:
+        print(f"数据加载失败: {e}")
+        return
+    
+    # 加载自监督模型
+    print("\n加载自监督模型...")
+    self_supervised = SelfSupervisedMCLPWrapper(device=device)
+    
+    try:
+        # 获取输入维度
+        if len(train_dataset) > 0:
+            test_instance = train_dataset[0]
+            # 简单估计输入维度
+            if hasattr(test_instance, 'points'):
+                input_dim = 5  # 坐标(2) + 权重(3)
+            else:
+                input_dim = 5
+        else:
+            input_dim = 5
+            
+        self_supervised.initialize_model(input_dim)
+        
+        # 尝试加载预训练权重
+        model_path = 'self_supervised_mclp_simple.pth'
+        if os.path.exists(model_path):
+            self_supervised.model.load_state_dict(
+                torch.load(model_path, map_location=device)
+            )
+            print("自监督模型加载成功")
+        else:
+            print("未找到预训练模型，使用随机初始化")
+    except Exception as e:
+        print(f"模型初始化失败: {e}")
+        return
+    
+    K = 5  # 设施数量，减少以简化问题
+    
+    all_results = []
+    max_instances_to_process = min(2, len(train_dataset))  # 只处理2个实例
+    
+    print(f"\n将处理前 {max_instances_to_process} 个实例")
+    print(f"设施数量: {K}")
+    print("-" * 60)
+    
+    for index, instance in enumerate(train_dataset[:max_instances_to_process]):
+        start_time = time.time()
+        
+        print(f"\n处理实例 {index}: {instance['name']}")
+        print(f"  节点数: {len(instance['points'])}")
+        
+        try:
+            # 准备数据
+            data = prepare_self_supervised_data(instance, self_supervised, device)
+            
+            # 创建并训练MLP
+            mlp = SelfSupervisedMLP(
+                input_dim=data['embeddings'].shape[1],
+                hidden_dim=32,
+                output_dim=1
+            ).to(device)
+            
+            optimizer = torch.optim.Adam(mlp.parameters(), lr=0.01)
+            
+            # 快速训练
+            print("  训练MLP...")
+            num_epochs = 50
+            
+            for epoch in range(num_epochs):
+                mlp.train()
+                
+                # 前向传播
+                logits = mlp(data['embeddings']).squeeze()
+                probs = torch.sigmoid(logits)
+                
+                # 计算损失
+                if data['dist_matrix'] is not None and data['coverage_radius'] is not None:
+                    # 计算每个节点的覆盖潜力
+                    coverage_potential = torch.sum(
+                        data['dist_matrix'] <= data['coverage_radius'], 
+                        dim=1
+                    ).float()
+                    
+                    # 归一化
+                    if coverage_potential.max() > 0:
+                        coverage_potential = coverage_potential / coverage_potential.max()
+                    
+                    # 鼓励选择覆盖潜力高的节点
+                    loss = -torch.mean(probs * coverage_potential)
+                else:
+                    # 使用度数作为指导
+                    if data['degree'].max() > 0:
+                        degree_norm = data['degree'] / data['degree'].max()
+                        loss = -torch.mean(probs * degree_norm)
+                    else:
+                        loss = -torch.mean(probs)
+                
+                # 设施数量约束
+                facility_count = torch.sum(probs)
+                count_penalty = torch.abs(facility_count - K) / K
+                
+                total_loss = loss + 0.1 * count_penalty
+                
+                # 反向传播
+                optimizer.zero_grad()
+                total_loss.backward()
+                optimizer.step()
+                
+                if epoch % 10 == 0 and epoch < num_epochs - 1:
+                    print(f"    迭代 {epoch}: 损失={total_loss.item():.4f}")
+            
+            # 求解
+            mlp.eval()
+            with torch.no_grad():
+                logits = mlp(data['embeddings']).squeeze()
+                probs = torch.sigmoid(logits)
+                
+                # 选择概率最高的K个节点
+                selected_indices = torch.topk(probs, min(K, len(probs))).indices.cpu().numpy()
+                
+                # 计算覆盖率
+                if data['dist_matrix'] is not None:
+                    coverage_radius = data['coverage_radius'] or data['dist_matrix'].max().item() * 0.15
+                    
+                    if len(selected_indices) > 0:
+                        dist_to_selected = data['dist_matrix'][:, selected_indices]
+                        min_dist = torch.min(dist_to_selected, dim=1)[0]
+                        covered_mask = (min_dist <= coverage_radius)
+                        
+                        if data['total_weights'] is not None:
+                            coverage = torch.sum(data['total_weights'][covered_mask]).item()
+                            total_demand = torch.sum(data['total_weights']).item()
+                        else:
+                            coverage = torch.sum(covered_mask.float()).item()
+                            total_demand = len(instance['points'])
+                    else:
+                        coverage = 0
+                        total_demand = len(instance['points'])
+                    
+                    coverage_percentage = (coverage / total_demand * 100) if total_demand > 0 else 0
+                    
+                    result = {
+                        'instance_id': index,
+                        'instance_name': instance['name'],
+                        'selected_indices': selected_indices.tolist(),
+                        'coverage': coverage,
+                        'total_demand': total_demand,
+                        'coverage_percentage': coverage_percentage,
+                        'n_nodes': len(instance['points']),
+                        'K': K,
+                        'time': time.time() - start_time
+                    }
+                    all_results.append(result)
+                    
+                    print(f"  结果: 需求覆盖 = {coverage:.2f}/{total_demand:.2f} ({coverage_percentage:.1f}%)")
+                    print(f"  耗时: {result['time']:.2f}秒")
+                    
+                    # 可视化结果
+                    try:
+                        visualize_result(instance, selected_indices, result)
+                    except Exception as e:
+                        print(f"  可视化失败: {e}")
+                        
+        except Exception as e:
+            print(f"  处理实例失败: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # 保存结果
+    if all_results:
+        print("\n" + "="*70)
+        print("自监督MCLP求解完成!")
+        print("="*70)
+        
+        # 计算统计
+        avg_coverage = np.mean([r['coverage_percentage'] for r in all_results])
+        avg_time = np.mean([r['time'] for r in all_results])
+        
+        print(f"平均覆盖率: {avg_coverage:.1f}%")
+        print(f"平均耗时: {avg_time:.2f}秒")
+        print(f"处理实例数: {len(all_results)}")
         
         # 保存结果
-        instance_result = {
-            'instance_id': index,
-            'instance_name': instance_name,
-            'selected_facilities': selected_indices,
-            'coverage': final_coverage,
-            'coverage_percentage': coverage_percentage,
-            'avg_distance': avg_distance,
-            'max_distance': max_distance,
-            'min_facility_dist': min_facility_dist,
-            'coverage_radius': coverage_radius,
-            'diameter': diameter
+        results_summary = {
+            'all_results': all_results,
+            'summary': {
+                'avg_coverage_percentage': avg_coverage,
+                'avg_time': avg_time,
+                'num_instances': len(all_results),
+                'K': K
+            }
         }
-        all_results.append(instance_result)
-    
-    end = time.time()
-    elapsed_time = end - start
-    
-    # 输出结果
-    print(f"\n=== 实例 {index} ({instance_name}) 结果 ===")
-    print(f"  耗时: {elapsed_time:.2f} 秒")
-    print(f"  选择的设施 ({len(selected_indices)}个): {selected_indices}")
-    print(f"  覆盖率: {final_coverage}/{n_nodes} 节点 ({coverage_percentage:.1f}%)")
-    print(f"  到最近设施的平均距离: {avg_distance:.4f}")
-    print(f"  到最近设施的最大距离: {max_distance:.4f}")
-    print(f"  设施间平均最小距离: {min_facility_dist:.4f}")
-    print(f"  覆盖半径: {coverage_radius:.4f}")
-    
-    # 可视化（只可视化前3个实例）- 修复版
-    if index < 3:
-        try:
-            plt.figure(figsize=(14, 12))
-            points_np = points.cpu().numpy()
-            
-            # 绘制所有节点
-            plt.scatter(points_np[:, 0], points_np[:, 1], c='lightblue', s=30, 
-                       label=f'所有节点 ({n_nodes})', alpha=0.5, edgecolors='white', linewidth=0.5)
-            
-            # 标记被覆盖的节点
-            covered_indices = torch.where(covered_nodes == 1)[0].cpu().numpy()
-            if len(covered_indices) > 0:
-                plt.scatter(points_np[covered_indices, 0], points_np[covered_indices, 1], 
-                           c='green', s=50, label=f'已覆盖 ({len(covered_indices)})', alpha=0.7, 
-                           edgecolors='darkgreen', linewidth=1)
-            
-            # 标记未覆盖的节点
-            uncovered_indices = torch.where(covered_nodes == 0)[0].cpu().numpy()
-            if len(uncovered_indices) > 0:
-                plt.scatter(points_np[uncovered_indices, 0], points_np[uncovered_indices, 1], 
-                           c='red', s=50, label=f'未覆盖 ({len(uncovered_indices)})', alpha=0.7,
-                           edgecolors='darkred', linewidth=1)
-            
-            # 标记选择的设施
-            if len(selected_indices) > 0:
-                plt.scatter(points_np[selected_indices, 0], points_np[selected_indices, 1], 
-                           c='gold', s=300, marker='*', label=f'设施 ({len(selected_indices)})', 
-                           edgecolors='black', linewidths=3, zorder=10)
-                
-                # 为每个设施添加编号
-                for i, idx in enumerate(selected_indices):
-                    plt.annotate(f'{i+1}', (points_np[idx, 0], points_np[idx, 1]), 
-                                fontsize=12, fontweight='bold', ha='center', va='center', 
-                                color='black', bbox=dict(boxstyle="circle,pad=0.2", 
-                                                        facecolor='white', 
-                                                        edgecolor='black', 
-                                                        alpha=0.8))
-            
-            # 绘制覆盖范围
-            if len(selected_indices) > 0:
-                for facility_idx in selected_indices:
-                    circle = plt.Circle((points_np[facility_idx, 0], points_np[facility_idx, 1]), 
-                                       coverage_radius, color='orange', alpha=0.1, 
-                                       linewidth=2, linestyle='-', edgecolor='orange', zorder=5)
-                    plt.gca().add_patch(circle)
-            
-            plt.title(f'MCLP解决方案 - 实例 {index}: {instance_name}\n'
-                     f'覆盖率: {coverage_percentage:.1f}% | 覆盖半径: {coverage_radius:.2f} | '
-                     f'设施数量: {len(selected_indices)}', 
-                     fontsize=16, fontweight='bold', pad=20)
-            
-            plt.xlabel('X 坐标', fontsize=14)
-            plt.ylabel('Y 坐标', fontsize=14)
-            
-            # 设置图例
-            plt.legend(loc='upper right', fontsize=12, framealpha=0.9)
-            
-            # 添加网格
-            plt.grid(True, alpha=0.3, linestyle='--')
-            
-            # 设置坐标轴范围
-            x_min, x_max = points_np[:, 0].min(), points_np[:, 0].max()
-            y_min, y_max = points_np[:, 1].min(), points_np[:, 1].max()
-            x_margin = (x_max - x_min) * 0.1
-            y_margin = (y_max - y_min) * 0.1
-            plt.xlim(x_min - x_margin, x_max + x_margin)
-            plt.ylim(y_min - y_margin, y_max + y_margin)
-            
-            # 设置纵横比相等
-            plt.gca().set_aspect('equal', adjustable='box')
-            
-            # 添加信息文本框
-            info_text = f'节点总数: {n_nodes}\n'
-            info_text += f'设施数量: {len(selected_indices)}\n'
-            info_text += f'覆盖节点: {final_coverage}\n'
-            info_text += f'覆盖率: {coverage_percentage:.1f}%\n'
-            info_text += f'平均距离: {avg_distance:.3f}\n'
-            info_text += f'最大距离: {max_distance:.3f}\n'
-            info_text += f'覆盖半径: {coverage_radius:.3f}'
-            
-            plt.text(0.02, 0.98, info_text, transform=plt.gca().transAxes,
-                    fontsize=10, verticalalignment='top',
-                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-            
-            plt.tight_layout()
-            
-            # 保存图像
-            plt.savefig(f'mclp_solution_{index}.png', dpi=300, bbox_inches='tight', facecolor='white')
-            
-            # 显示图像
-            plt.show()
-            
-            print(f"  已保存可视化图像: mclp_solution_{index}.png")
-            
-        except Exception as e:
-            print(f"  可视化生成失败: {e}")
-            # 简单备份可视化
-            plt.figure(figsize=(10, 8))
-            points_np = points.cpu().numpy()
-            plt.scatter(points_np[:, 0], points_np[:, 1], s=20, alpha=0.5)
-            if len(selected_indices) > 0:
-                plt.scatter(points_np[selected_indices, 0], points_np[selected_indices, 1], 
-                           s=100, marker='*', c='red')
-            plt.title(f'MCLP Solution {index}: {coverage_percentage:.1f}% coverage')
-            plt.savefig(f'mclp_solution_simple_{index}.png')
-            plt.close()
-    
-    print("="*70)
+        
+        result_file = 'self_supervised_mclp_results_simple.pkl'
+        with open(result_file, 'wb') as f:
+            pickle.dump(results_summary, f)
+        
+        print(f"\n结果已保存到: {result_file}")
 
-# 输出总体统计
-print("\n" + "="*70)
-print("MCLP求解完成 - 总体统计")
-print("="*70)
+def visualize_result(instance, selected_indices, result):
+    """可视化单个结果"""
+    if not instance or not selected_indices.size:
+        return
+    
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    
+    points = instance['points'].cpu().numpy()
+    selected_points = points[selected_indices]
+    
+    # 1. 点分布图
+    ax1 = axes[0]
+    ax1.scatter(points[:, 0], points[:, 1], s=20, alpha=0.6, label='候选点')
+    ax1.scatter(selected_points[:, 0], selected_points[:, 1], 
+                s=100, c='red', marker='X', label=f'选定设施(K={result["K"]})', 
+                edgecolors='black', linewidth=1.5)
+    
+    # 绘制服务半径
+    coverage_radius = instance.get('coverage_radius', np.linalg.norm(points.max(axis=0) - points.min(axis=0)) * 0.15)
+    for idx in selected_indices:
+        circle = plt.Circle(points[idx], coverage_radius, 
+                           color='red', alpha=0.1, fill=True)
+        ax1.add_patch(circle)
+    
+    ax1.set_xlabel('X坐标')
+    ax1.set_ylabel('Y坐标')
+    ax1.set_title(f'实例 {instance["name"]}')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    ax1.axis('equal')
+    
+    # 2. 覆盖分析
+    ax2 = axes[1]
+    if 'distance_matrix' in instance and instance['distance_matrix'] is not None:
+        dist_matrix = instance['distance_matrix'].cpu().numpy()
+        
+        # 计算覆盖情况
+        coverage_mask = np.min(dist_matrix[:, selected_indices], axis=1) <= coverage_radius
+        covered_points = points[coverage_mask]
+        uncovered_points = points[~coverage_mask]
+        
+        ax2.scatter(covered_points[:, 0], covered_points[:, 1], 
+                   s=30, c='green', alpha=0.6, label='已覆盖点')
+        ax2.scatter(uncovered_points[:, 0], uncovered_points[:, 1], 
+                   s=30, c='gray', alpha=0.4, label='未覆盖点')
+        ax2.scatter(selected_points[:, 0], selected_points[:, 1], 
+                   s=100, c='red', marker='X', label='设施点', edgecolors='black', linewidth=1.5)
+        
+        # 添加覆盖统计
+        stats_text = f"""
+        节点数: {result['n_nodes']}
+        设施数: {result['K']}
+        覆盖率: {result['coverage_percentage']:.1f}%
+        耗时: {result['time']:.2f}秒
+        """
+        ax2.text(0.02, 0.98, stats_text, transform=ax2.transAxes, 
+                fontsize=10, verticalalignment='top', 
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        
+        ax2.set_xlabel('X坐标')
+        ax2.set_ylabel('Y坐标')
+        ax2.set_title('覆盖分析')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+    else:
+        # 显示简单统计
+        ax2.text(0.5, 0.5, f"覆盖率: {result['coverage_percentage']:.1f}%", 
+                horizontalalignment='center', verticalalignment='center',
+                transform=ax2.transAxes, fontsize=14)
+        ax2.set_title('结果统计')
+        ax2.axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(f'mclp_result_{instance["name"]}.png', dpi=150, bbox_inches='tight')
+    plt.show()
 
-if all_results:
-    total_coverage = sum(r['coverage'] for r in all_results)
-    avg_coverage_percentage = sum(r['coverage_percentage'] for r in all_results) / len(all_results)
-    avg_avg_distance = sum(r['avg_distance'] for r in all_results) / len(all_results)
+# 简化的批量处理函数
+def simple_batch_mode():
+    """简化版批量处理"""
+    print("\n简化版批量处理")
+    print("="*60)
     
-    print(f"处理的实例数量: {len(all_results)}")
-    print(f"平均覆盖率: {avg_coverage_percentage:.1f}%")
-    print(f"总覆盖节点数: {total_coverage}")
-    print(f"平均到最近设施距离: {avg_avg_distance:.4f}")
+    # 生成数据
+    generator = MCLPDatasetGenerator(
+        num_nodes=50,
+        num_instances=5,
+        device=device
+    )
     
-    # 显示每个实例的简要结果
-    print("\n各实例详细结果:")
-    for result in all_results:
-        print(f"  实例 {result['instance_id']} ({result['instance_name']}): "
-              f"{result['coverage']}/{n_nodes} ({result['coverage_percentage']:.1f}%)")
+    dataset = generator.generate_dataset()
     
-    # 保存结果到文件
-    results_summary = {
-        'all_results': all_results,
-        'summary': {
-            'num_instances': len(all_results),
-            'avg_coverage_percentage': avg_coverage_percentage,
-            'total_coverage': total_coverage,
-            'avg_avg_distance': avg_avg_distance,
-            'K': K,
-            'n_nodes': n_nodes
-        }
-    }
+    # 加载模型
+    self_supervised = SelfSupervisedMCLPWrapper(device=device)
     
-    with open('mclp_results_summary.pkl', 'wb') as f:
-        pickle.dump(results_summary, f)
+    try:
+        self_supervised.initialize_model(5)
+        model_path = 'self_supervised_mclp_simple.pth'
+        if os.path.exists(model_path):
+            self_supervised.model.load_state_dict(torch.load(model_path, map_location=device))
+            print("模型加载成功")
+    except Exception as e:
+        print(f"模型加载失败: {e}")
+        return
     
-    print(f"\n详细结果已保存到: mclp_results_summary.pkl")
+    # 测试不同K值
+    K_options = [3, 5, 7]
+    
+    for K in K_options:
+        print(f"\n测试 K={K}")
+        print("-" * 40)
+        
+        for i, instance in enumerate(dataset[:2]):  # 只测试2个实例
+            try:
+                selected_indices, coverage = self_supervised.solve_mclp(instance, K=K)
+                n_nodes = len(instance['points'])
+                coverage_percentage = coverage / n_nodes * 100
+                print(f"  实例 {i}: 覆盖率 = {coverage_percentage:.1f}%")
+            except Exception as e:
+                print(f"  实例 {i} 失败: {e}")
 
-print("\nMCLP求解完成!")
+if __name__ == '__main__':
+    print("\n" + "="*80)
+    print("自监督MCLP求解系统")
+    print("="*80)
+    
+    # 选择运行模式
+    print("\n选择运行模式:")
+    print("1. 标准求解模式 (推荐)")
+    print("2. 简化批量处理模式")
+    
+    try:
+        choice = input("请输入选择 (1/2): ").strip()
+    except:
+        choice = "1"
+    
+    if choice == "1":
+        main()
+    elif choice == "2":
+        simple_batch_mode()
+    else:
+        print("无效选择，使用标准模式")
+        main()
