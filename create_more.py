@@ -344,87 +344,80 @@ class MCLPDatasetGenerator:
         return dataset
 
 # ========== 图构建函数（优化版） ==========
-def build_mclp_graph(instance, graph_threshold=None, distance_metric='euclidean'):
-    """为MCLP问题构建图（增强特征）"""
+def build_mclp_graph(instance):
+    """
+    MCLP-aware 图构建
+    - 边：服务半径内覆盖边
+    - degree：覆盖需求权重和
+    - distance encoding：soft coverage potential
+    """
     points = instance['points']
-    
-    # 使用预计算的距离矩阵或重新计算
-    if 'distance_matrix' in instance:
-        dist = instance['distance_matrix']
-    else:
-        dist_func = _get_distance_func(distance_metric)
-        dist = dist_func(points, points, points.device)
-    
-    # 确定图构建阈值（基于文旅场景）
-    if graph_threshold is None:
-        avg_dist = dist[dist > 0].mean().item()
-        graph_threshold = avg_dist * 0.3
-    
-    # 构建边（双向连接）
-    edge_mask = dist <= graph_threshold
-    edge_indices = torch.nonzero(edge_mask, as_tuple=False).t()
-    
-    # 计算边权重（距离的倒数，归一化）
-    edge_dists = dist[edge_indices[0], edge_indices[1]]
-    edge_attrs = 1.0 / (edge_dists + 1e-6)
-    edge_attrs = edge_attrs / edge_attrs.max() if edge_attrs.max() > 0 else edge_attrs
-    
-    # 构建节点特征（增强）
-    node_features_list = [points]
-    
+    device = points.device
+
+    dist = instance['distance_matrix']
+    R = instance['coverage_radius']
+    weights = instance.get('total_weights', torch.ones(len(points), device=device))
+
+    N = len(points)
+
+    # ========= 1. 覆盖边（服务半径内） =========
+    cover_mask = (dist <= R) & (dist > 0)
+    edge_index = torch.nonzero(cover_mask, as_tuple=False).t()
+
+    # 边权：距离越近越大（soft）
+    edge_dist = dist[edge_index[0], edge_index[1]]
+    edge_weight = torch.exp(-edge_dist / R).unsqueeze(1)
+
+    # ========= 2. Degree Encoding（覆盖需求权重） =========
+    # degree[i] = sum_{j:d_ij<=R} w_j
+    degree = torch.zeros(N, device=device)
+
+    for i in range(N):
+        covered = cover_mask[i]
+        if covered.any():
+            degree[i] = weights[covered].sum()
+
+    degree = degree.unsqueeze(1)
+    degree_norm = degree / (degree.max() + 1e-6)
+
+    # ========= 3. Distance Encoding（覆盖潜力） =========
+    # dist_feat[i] = sum_j w_j * exp(-d_ij / R)
+    dist_feat = torch.zeros(N, device=device)
+
+    for i in range(N):
+        dist_feat[i] = torch.sum(
+            weights * torch.exp(-dist[i] / R)
+        )
+
+    dist_feat = dist_feat.unsqueeze(1)
+    dist_feat = dist_feat / (dist_feat.max() + 1e-6)
+
+    # ========= 4. 节点特征 =========
+    node_feats = [points]
+
     if instance.get('tourism_features') is not None:
-        node_features_list.append(instance['tourism_features'])
-    
-    if instance.get('population_weights') is not None:
-        node_features_list.append(instance['population_weights'].unsqueeze(1))
-    
-    if instance.get('road_weights') is not None:
-        node_features_list.append(instance['road_weights'].unsqueeze(1))
-    
-    if instance.get('total_weights') is not None:
-        node_features_list.append(instance['total_weights'].unsqueeze(1))
-    
-    node_features = torch.cat(node_features_list, dim=1)
-    
-    # 计算节点重要性特征
-    dist_row_sum = torch.sum(dist, dim=1, keepdim=True)
-    dist_row_norm = dist_row_sum / dist_row_sum.max() if dist_row_sum.max() > 0 else dist_row_sum
-    
-    # 计算度数特征
-    if edge_indices.shape[1] > 0:
-        degree = torch.zeros(len(points), dtype=torch.long, device=points.device)
-        unique, counts = torch.unique(edge_indices[0], return_counts=True)
-        degree[unique] = counts
-        degree = degree.float().unsqueeze(1)
-        degree_norm = degree / degree.max() if degree.max() > 0 else degree
-    else:
-        degree = torch.ones(len(points), 1, device=points.device)
-        degree_norm = degree
-    
-    # 创建图数据对象
-    graph_data = pyg.data.Data(
-        x=node_features,
-        edge_index=edge_indices,
-        edge_attr=edge_attrs.unsqueeze(1),
+        node_feats.append(instance['tourism_features'])
+
+    node_feats.append(weights.unsqueeze(1))
+
+    x = torch.cat(node_feats, dim=1)
+
+    # ========= 5. 构建 PyG Data =========
+    graph = pyg.data.Data(
+        x=x,
+        edge_index=edge_index,
+        edge_attr=edge_weight,
         pos=points,
-        dist_row_sum=dist_row_norm,
         degree=degree_norm,
-        tourism_features=instance.get('tourism_features'),
-        population_weights=instance.get('population_weights'),
-        road_weights=instance.get('road_weights'),
-        total_weights=instance.get('total_weights'),
-        spatial_labels=instance.get('spatial_labels'),
-        region_labels=instance.get('region_labels'),
+        dist_row_sum=dist_feat,
         distance_matrix=dist,
-        coverage_radius=instance.get('coverage_radius', graph_threshold * 2),
-        graph_threshold=graph_threshold,
-        diameter=dist.max().item(),
-        avg_distance=instance.get('avg_distance', dist[dist > 0].mean().item()),
+        coverage_radius=R,
+        total_weights=weights,
         instance_name=instance['name'],
         instance_id=instance['instance_id']
     )
-    
-    return graph_data
+
+    return graph
 
 # ========== 数据集工具函数 ==========
 def save_dataset(dataset, file_path: str):
