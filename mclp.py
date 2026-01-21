@@ -5,6 +5,8 @@ import pickle
 import os
 import matplotlib.pyplot as plt
 import matplotlib
+from load_real_data import load_osm_poi_data
+
 from create_more import (
     MCLPDatasetGenerator,
     build_mclp_graph,
@@ -34,7 +36,11 @@ def main():
     # --------------------------------------------------------
     print("\n加载文旅 MCLP 数据集...")
     dataset_file = 'mclp_tourism_test_50.pkl'
-
+    
+    shared_points, shared_tourism_features = load_osm_poi_data(
+    max_points=200,
+    device=device
+    )
     if not os.path.exists(dataset_file):
         print("未找到数据集，生成新数据...")
         generator = MCLPDatasetGenerator(
@@ -42,7 +48,9 @@ def main():
             num_instances=20,
             device=device,
             include_tourism_features=True,
-            tourism_hotspots=8
+            tourism_hotspots=8,
+            shared_points=shared_points,
+            shared_tourism_features=shared_tourism_features
         )
         dataset = generator.generate_dataset()
         save_dataset(dataset, dataset_file)

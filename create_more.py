@@ -5,6 +5,7 @@ import time
 import pickle
 from typing import Tuple, List, Optional, Dict, Any
 from sklearn.cluster import KMeans
+from load_real_data import load_osm_poi_data
 
 # ========== 距离计算函数 ==========
 def _get_distance_func(distance_metric: str):
@@ -63,7 +64,9 @@ class MCLPDatasetGenerator:
                  include_tourism_features: bool = True,
                  generate_regions: bool = True,
                  urban_ratio: float = 0.6,
-                 tourism_hotspots: int = 8):
+                 tourism_hotspots: int = 8,
+                 shared_points=None,
+                 shared_tourism_features=None):
         self.num_nodes = num_nodes
         self.dim = dim
         self.num_instances = num_instances
@@ -76,6 +79,9 @@ class MCLPDatasetGenerator:
         self.generate_regions = generate_regions
         self.urban_ratio = urban_ratio
         self.tourism_hotspots = tourism_hotspots
+        self.shared_points = shared_points
+        self.shared_tourism_features = shared_tourism_features
+
     def generate_tourism_distribution(self):
         """生成文旅场景分布：景点、道路、休息区"""
         n = self.num_nodes
@@ -259,8 +265,19 @@ class MCLPDatasetGenerator:
         np.random.seed(seed)
         
         # 1. 生成文旅场景分布
-        points, spatial_labels, tourism_features = self.generate_tourism_distribution()
-        
+
+        if self.shared_points is not None:
+            points = self.shared_points.clone()
+            # ====== 关键新增：实例级轻微扰动 ======
+            noise_scale = 50.0  # 单位：米（20~100 都可以）
+            noise = torch.randn_like(points) * noise_scale
+            points = points + noise
+
+            tourism_features = self.shared_tourism_features.clone()
+            spatial_labels = None
+        else:
+            raise RuntimeError("未提供 shared_points（真实 OSM 数据）")
+
         # 2. 生成权重数据
         population_weights = None
         road_weights = None
@@ -296,8 +313,9 @@ class MCLPDatasetGenerator:
         
         # 6. 计算覆盖半径（基于文旅场景调整）
         avg_dist = distance_matrix[distance_matrix > 0].mean().item()
-        coverage_radius = avg_dist * 0.25  # 更合理的覆盖半径
-        
+        #coverage_radius = avg_dist * 0.25  # 更合理的覆盖半径
+        coverage_radius = 300.0  # 更合理的覆盖半径
+
         # 7. 构建实例信息
         instance_info = {
             'name': f'mclp_tourism_{instance_id:04d}',
