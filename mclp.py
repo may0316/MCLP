@@ -1,3 +1,4 @@
+# mclp.py (稳定版)
 import time
 import numpy as np
 import torch
@@ -5,15 +6,8 @@ import pickle
 import os
 import matplotlib.pyplot as plt
 import matplotlib
-from load_real_data import load_osm_poi_data
-
-from create_more import (
-    MCLPDatasetGenerator,
-    build_mclp_graph,
-    load_dataset,
-    save_dataset
-)
-from self_supervised_mclp import SelfSupervisedMCLPWrapper
+from create_more import build_mclp_graph, load_dataset
+from self_supervised_mclp import StableSelfSupervisedMCLPWrapper
 
 matplotlib.rcParams['font.sans-serif'] = ['SimHei']
 matplotlib.rcParams['axes.unicode_minus'] = False
@@ -21,200 +15,263 @@ matplotlib.rcParams['axes.unicode_minus'] = False
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"使用设备: {device}")
 
-
-# ============================================================
-# 主流程
-# ============================================================
+def visualize_solution(instance, selected_indices, coverage_pct, K, save_path=None):
+    """可视化解决方案"""
+    points = instance['points']
+    if torch.is_tensor(points):
+        points = points.cpu().numpy()
+    
+    selected_points = points[selected_indices]
+    
+    plt.figure(figsize=(8, 8))
+    
+    # 所有点
+    plt.scatter(points[:, 0], points[:, 1], s=20, alpha=0.5, c='gray', label='需求点')
+    
+    # 选中的设施
+    plt.scatter(selected_points[:, 0], selected_points[:, 1],
+               s=200, c='red', marker='X', label=f'选定设施 (K={K})')
+    
+    # 覆盖范围
+    r = instance['coverage_radius']
+    for idx in selected_indices:
+        circle = plt.Circle(points[idx], r, color='red', alpha=0.1, linewidth=0)
+        plt.gca().add_patch(circle)
+    
+    # 标记覆盖的点
+    if isinstance(points, np.ndarray):
+        points_tensor = torch.from_numpy(points)
+    else:
+        points_tensor = points
+    
+    dist_matrix = torch.cdist(points_tensor, points_tensor)
+    covered_mask = torch.any(
+        dist_matrix[:, selected_indices] <= r,
+        dim=1
+    ).cpu().numpy()
+    
+    covered_points = points[covered_mask]
+    if len(covered_points) > 0:
+        plt.scatter(covered_points[:, 0], covered_points[:, 1],
+                   s=40, alpha=0.7, c='green', label='覆盖点')
+    
+    plt.title(f"{instance.get('name', '实例')} | K={K} | 覆盖率: {coverage_pct:.1f}%")
+    plt.legend(loc='upper right')
+    plt.axis('equal')
+    plt.grid(True, alpha=0.3)
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"可视化已保存: {save_path}")
+    else:
+        plt.show()
+    
+    plt.close()
 
 def main():
     print("\n" + "=" * 80)
-    print("文旅场景 MCLP 求解（自监督 Soft-MCLP → Hard 推理）")
+    print("文旅MCLP求解（稳定版）")
     print("=" * 80)
-
-    # --------------------------------------------------------
-    # 1. 加载或生成数据
-    # --------------------------------------------------------
-    print("\n加载文旅 MCLP 数据集...")
-    dataset_file = 'mclp_tourism_test_50.pkl'
     
-    shared_points, shared_tourism_features = load_osm_poi_data(
-    max_points=200,
-    device=device
-    )
-    if not os.path.exists(dataset_file):
-        print("未找到数据集，生成新数据...")
-        generator = MCLPDatasetGenerator(
-            num_nodes=200,
-            num_instances=20,
-            device=device,
-            include_tourism_features=True,
-            tourism_hotspots=8,
-            shared_points=shared_points,
-            shared_tourism_features=shared_tourism_features
-        )
-        dataset = generator.generate_dataset()
-        save_dataset(dataset, dataset_file)
-    else:
-        dataset = load_dataset(dataset_file)
-
-    print(f"数据集实例数: {len(dataset)}")
-
-    # 测试阶段只用少量
-    dataset = dataset[:5]
-
     # --------------------------------------------------------
-    # 2. 初始化自监督 MCLP 模型
+    # 1. 加载数据
     # --------------------------------------------------------
-    print("\n初始化 Self-Supervised MCLP 模型...")
-    wrapper = SelfSupervisedMCLPWrapper(device=device)
-
-    test_graph = build_mclp_graph(dataset[0])
-    input_dim = test_graph.x.shape[1]
-
-    wrapper.initialize_model(
-        input_dim=input_dim,
-        hidden_dim=128,
-        output_dim=64
-    )
-
-    model_path = 'moco_mclp_pretrained.pth'
-    if os.path.exists(model_path):
-        wrapper.model.load_state_dict(
-            torch.load(model_path, map_location=device)
-        )
-        print("已加载预训练模型")
-    else:
-        print(" 未找到预训练模型，使用随机初始化")
-
+    print("\n1. 加载数据...")
+    
+    dataset_files = ['simple_mclp_dataset.pkl', 'mclp_tourism_train_improved.pkl']
+    dataset = None
+    
+    for file in dataset_files:
+        if os.path.exists(file):
+            print(f"加载数据集: {file}")
+            try:
+                dataset = load_dataset(file)
+                break
+            except:
+                with open(file, 'rb') as f:
+                    dataset = pickle.load(f)
+                break
+    
+    if dataset is None:
+        print("未找到数据集，使用默认测试数据...")
+        # 创建简单测试数据
+        dataset = []
+        for i in range(3):
+            points = torch.randn(50, 2)
+            dataset.append({
+                'name': f'test_{i}',
+                'points': points,
+                'weights': torch.ones(50),
+                'coverage_radius': 0.4
+            })
+    
+    print(f"加载了 {len(dataset)} 个实例")
+    
+    # 使用前3个实例测试
+    test_instances = dataset[:3]
+    
     # --------------------------------------------------------
-    # 3. 求解 MCLP
+    # 2. 初始化模型
     # --------------------------------------------------------
-    K = 10
-    all_results = []
-
-    print(f"\n开始求解 MCLP（K={K}）")
-    print("=" * 70)
-
-    for idx, instance in enumerate(dataset):
-        print(f"\n处理实例 {idx}: {instance['name']}")
-        start_time = time.time()
-
+    print("\n2. 初始化模型...")
+    
+    wrapper = StableSelfSupervisedMCLPWrapper(device=device)
+    
+    # 获取输入维度
+    test_instance = test_instances[0]
+    try:
+        test_graph = build_mclp_graph(test_instance)
+        input_dim = test_graph.x.shape[1]
+    except:
+        # 简单估计
+        input_dim = test_instance['points'].shape[1]
+        if 'tourism_features' in test_instance:
+            input_dim += test_instance['tourism_features'].shape[1]
+    
+    wrapper.initialize_model(input_dim=input_dim)
+    
+    # 尝试加载预训练模型
+    model_files = ['stable_mclp_model.pth', 'moco_mclp_pretrained.pth']
+    model_loaded = False
+    
+    for model_file in model_files:
+        if os.path.exists(model_file):
+            print(f"加载预训练模型: {model_file}")
+            wrapper.load_model(model_file)
+            model_loaded = True
+            break
+    
+    if not model_loaded:
+        print("未找到预训练模型，进行快速训练...")
+        # 快速训练
+        print("快速训练中...")
+        for i, instance in enumerate(test_instances[:2]):
+            try:
+                graph = build_mclp_graph(instance)
+                wrapper.train_on_instance(graph, epochs=20, K=10)
+            except:
+                continue
+    
+    # --------------------------------------------------------
+    # 3. 求解MCLP
+    # --------------------------------------------------------
+    print("\n3. 求解MCLP...")
+    print("=" * 50)
+    
+    results = []
+    K = 10  # 默认K值
+    
+    for idx, instance in enumerate(test_instances):
+        print(f"\n实例 {idx}: {instance.get('name', '未知')}")
+        
         try:
             # 构建图
             graph = build_mclp_graph(instance)
-
-            # -----------------------------
-            # 核心：Hard 推理（Top-K）
-            # -----------------------------
-            wrapper.model.eval()
-            with torch.no_grad():
-                _, scores = wrapper.model(graph)
-                selected_indices = torch.topk(scores, K).indices.cpu().numpy()
-
-            # -----------------------------
-            # 覆盖率计算（真实 MCLP）
-            # -----------------------------
-            dist_matrix = graph.distance_matrix
-            coverage_radius = graph.coverage_radius
-
-            dist_to_sel = dist_matrix[:, selected_indices]
-            min_dist = torch.min(dist_to_sel, dim=1)[0]
-            covered_mask = (min_dist <= coverage_radius)
-
+            
+            start_time = time.time()
+            
+            # 求解
+            selected_indices, coverage, scores = wrapper.solve_mclp(graph, K)
+            
+            # 计算覆盖率
             if hasattr(graph, 'total_weights') and graph.total_weights is not None:
-                covered = torch.sum(graph.total_weights[covered_mask]).item()
-                total = torch.sum(graph.total_weights).item()
+                total_demand = torch.sum(graph.total_weights).item()
             else:
-                covered = covered_mask.float().sum().item()
-                total = graph.num_nodes
-
-            coverage_pct = 100.0 * covered / max(total, 1)
-
+                total_demand = graph.num_nodes
+            
+            coverage_pct = (coverage / total_demand) * 100 if total_demand > 0 else 0
+            
+            # 记录结果
             result = {
                 'instance_id': idx,
-                'instance_name': instance['name'],
-                'selected_indices': selected_indices.tolist(),
-                'coverage': covered,
-                'total_demand': total,
-                'coverage_percentage': coverage_pct,
-                'n_nodes': graph.num_nodes,
+                'instance_name': instance.get('name', f'instance_{idx}'),
                 'K': K,
-                'coverage_radius': coverage_radius,
+                'selected_indices': selected_indices.tolist(),
+                'coverage': coverage,
+                'total_demand': total_demand,
+                'coverage_percentage': coverage_pct,
                 'time': time.time() - start_time
             }
-
-            all_results.append(result)
-
-            print(f"  覆盖率: {coverage_pct:.2f}%")
-            print(f"  用时: {result['time']:.2f}s")
-
-            visualize_result(instance, selected_indices, result)
-
+            
+            results.append(result)
+            
+            print(f"  覆盖率: {coverage_pct:.1f}%")
+            print(f"  选定设施数: {len(selected_indices)}")
+            print(f"  用时: {result['time']:.3f}s")
+            
+            # 可视化
+            visualize_solution(
+                instance, 
+                selected_indices, 
+                coverage_pct, 
+                K,
+                save_path=f'solution_instance_{idx}_K{K}.png'
+            )
+            
         except Exception as e:
-            print(f"实例 {idx} 失败: {e}")
+            print(f"  求解失败: {e}")
             import traceback
             traceback.print_exc()
-
+            continue
+    
     # --------------------------------------------------------
-    # 4. 汇总结果
+    # 4. 结果汇总
     # --------------------------------------------------------
-    if all_results:
-        print("\n" + "=" * 70)
-        coverages = [r['coverage_percentage'] for r in all_results]
-        times = [r['time'] for r in all_results]
+    if results:
+        print("\n" + "=" * 50)
+        print("结果汇总:")
+        print("=" * 50)
+        
+        coverages = [r['coverage_percentage'] for r in results]
+        times = [r['time'] for r in results]
+        
+        print(f"成功求解实例数: {len(results)}/{len(test_instances)}")
+        print(f"平均覆盖率: {np.mean(coverages):.1f}%")
+        print(f"覆盖率范围: {min(coverages):.1f}% - {max(coverages):.1f}%")
+        print(f"平均用时: {np.mean(times):.3f}s")
+        
+        # 保存结果
+        with open('mclp_results.pkl', 'wb') as f:
+            pickle.dump(results, f)
+        print(f"\n结果已保存: mclp_results.pkl")
+        
+        # 绘制汇总图
+        plt.figure(figsize=(10, 6))
+        
+        # 条形图
+        x_pos = np.arange(len(results))
+        bars = plt.bar(x_pos, coverages, alpha=0.7)
+        
+        # 标注
+        for i, (bar, cov) in enumerate(zip(bars, coverages)):
+            plt.text(bar.get_x() + bar.get_width()/2., bar.get_height(),
+                    f'{cov:.1f}%', ha='center', va='bottom')
+            
+            # 实例名称
+            instance_name = results[i]['instance_name']
+            plt.text(bar.get_x() + bar.get_width()/2., -5, 
+                    instance_name[:10], ha='center', va='top', rotation=45)
+        
+        plt.axhline(y=np.mean(coverages), color='red', linestyle='--', 
+                   label=f'平均值: {np.mean(coverages):.1f}%')
+        
+        plt.ylabel('覆盖率 (%)')
+        plt.title(f'MCLP求解结果汇总 (K={K})')
+        plt.ylim(0, 100)
+        plt.legend()
+        plt.grid(True, alpha=0.3, axis='y')
+        plt.tight_layout()
+        
+        plt.savefig('results_summary.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        print("结果汇总图已保存: results_summary.png")
+        
+    else:
+        print("\n没有成功求解的实例")
+    
+    print("\n" + "=" * 80)
+    print("MCLP求解完成！")
+    print("=" * 80)
 
-        print(f"平均覆盖率: {np.mean(coverages):.2f}% ± {np.std(coverages):.2f}%")
-        print(f"平均用时: {np.mean(times):.2f}s")
-
-        with open('mclp_tourism_results.pkl', 'wb') as f:
-            pickle.dump(all_results, f)
-
-        visualize_statistics(all_results)
-
-
-# ============================================================
-# 可视化
-# ============================================================
-
-def visualize_result(instance, selected_indices, result):
-    points = instance['points'].cpu().numpy()
-    selected_points = points[selected_indices]
-
-    fig, ax = plt.subplots(figsize=(6, 6))
-    ax.scatter(points[:, 0], points[:, 1], s=20, alpha=0.6, label='候选点')
-    ax.scatter(
-        selected_points[:, 0],
-        selected_points[:, 1],
-        s=150,
-        c='red',
-        marker='X',
-        label='选定设施'
-    )
-
-    r = result['coverage_radius']
-    for idx in selected_indices:
-        circle = plt.Circle(points[idx], r, color='red', alpha=0.08)
-        ax.add_patch(circle)
-
-    ax.set_title(f"{instance['name']} | 覆盖率 {result['coverage_percentage']:.1f}%")
-    ax.legend()
-    ax.axis('equal')
-    ax.grid(True, alpha=0.3)
-    plt.show()
-
-
-def visualize_statistics(all_results):
-    coverages = [r['coverage_percentage'] for r in all_results]
-    plt.figure(figsize=(6, 4))
-    plt.bar(range(len(coverages)), coverages)
-    plt.ylabel("覆盖率 (%)")
-    plt.xlabel("实例")
-    plt.title("文旅 MCLP 覆盖率对比")
-    plt.ylim(0, 100)
-    plt.grid(axis='y', alpha=0.3)
-    plt.show()
-
-
-# ============================================================
 if __name__ == '__main__':
     main()

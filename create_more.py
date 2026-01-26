@@ -362,65 +362,119 @@ class MCLPDatasetGenerator:
         return dataset
 
 # ========== 图构建函数（优化版） ==========
-def build_mclp_graph(instance):
+# ========== 图构建函数（修复版） ==========
+def build_mclp_graph(instance, device=None):
     """
-    MCLP-aware 图构建
-    - 边：服务半径内覆盖边
-    - degree：覆盖需求权重和
-    - distance encoding：soft coverage potential
+    MCLP-aware 图构建（修复版）
+    - 如果缺少 distance_matrix，自动计算
+    - 更好的错误处理和兼容性
     """
+    # 提取数据
     points = instance['points']
-    device = points.device
-
-    dist = instance['distance_matrix']
-    R = instance['coverage_radius']
-    weights = instance.get('total_weights', torch.ones(len(points), device=device))
-
+    
+    # 处理设备
+    if device is None:
+        device = points.device if torch.is_tensor(points) else torch.device('cpu')
+    
+    # 转换为张量
+    if not torch.is_tensor(points):
+        points = torch.tensor(points, dtype=torch.float).to(device)
+    else:
+        points = points.to(device)
+    
+    # 获取覆盖半径
+    if 'coverage_radius' in instance:
+        coverage_radius = instance['coverage_radius']
+        if isinstance(coverage_radius, torch.Tensor):
+            coverage_radius = coverage_radius.item()
+    else:
+        coverage_radius = 0.3  # 默认值
+    
+    # 获取权重
+    if 'total_weights' in instance:
+        weights = instance['total_weights']
+        if not torch.is_tensor(weights):
+            weights = torch.tensor(weights, dtype=torch.float).to(device)
+        else:
+            weights = weights.to(device)
+    else:
+        weights = torch.ones(len(points), device=device)
+    
     N = len(points)
-
-    # ========= 1. 覆盖边（服务半径内） =========
-    cover_mask = (dist <= R) & (dist > 0)
+    
+    # ========= 1. 计算距离矩阵（如果不存在） =========
+    if 'distance_matrix' in instance:
+        dist = instance['distance_matrix']
+        if not torch.is_tensor(dist):
+            dist = torch.tensor(dist, dtype=torch.float).to(device)
+        else:
+            dist = dist.to(device)
+    else:
+        # 动态计算距离矩阵
+        print(f"  警告: 实例 {instance.get('name', 'unknown')} 缺少 distance_matrix，正在计算...")
+        dist = _pairwise_euclidean(points, points, device)
+    
+    # ========= 2. 覆盖边（服务半径内） =========
+    cover_mask = (dist <= coverage_radius) & (dist > 0)
     edge_index = torch.nonzero(cover_mask, as_tuple=False).t()
-
+    
+    if edge_index.shape[1] == 0:
+        # 如果没有边，创建一些邻居边
+        print(f"  警告: 实例 {instance.get('name', 'unknown')} 没有覆盖边，创建KNN边...")
+        # 计算KNN
+        k = min(5, N-1)
+        from sklearn.neighbors import kneighbors_graph
+        points_np = points.cpu().numpy()
+        knn_graph = kneighbors_graph(points_np, k, mode='connectivity', include_self=False)
+        edge_index = torch.tensor(np.array(knn_graph.nonzero()), dtype=torch.long).to(device)
+    
     # 边权：距离越近越大（soft）
-    edge_dist = dist[edge_index[0], edge_index[1]]
-    edge_weight = torch.exp(-edge_dist / R).unsqueeze(1)
-
-    # ========= 2. Degree Encoding（覆盖需求权重） =========
-    # degree[i] = sum_{j:d_ij<=R} w_j
+    if edge_index.shape[1] > 0:
+        edge_dist = dist[edge_index[0], edge_index[1]]
+        edge_weight = torch.exp(-edge_dist / coverage_radius).unsqueeze(1)
+    else:
+        edge_weight = torch.ones(0, 1, device=device)
+    
+    # ========= 3. Degree Encoding（覆盖需求权重） =========
     degree = torch.zeros(N, device=device)
-
     for i in range(N):
         covered = cover_mask[i]
         if covered.any():
             degree[i] = weights[covered].sum()
-
+    
     degree = degree.unsqueeze(1)
-    degree_norm = degree / (degree.max() + 1e-6)
-
-    # ========= 3. Distance Encoding（覆盖潜力） =========
-    # dist_feat[i] = sum_j w_j * exp(-d_ij / R)
+    if degree.max() > 0:
+        degree_norm = degree / (degree.max() + 1e-6)
+    else:
+        degree_norm = degree
+    
+    # ========= 4. Distance Encoding（覆盖潜力） =========
     dist_feat = torch.zeros(N, device=device)
-
     for i in range(N):
         dist_feat[i] = torch.sum(
-            weights * torch.exp(-dist[i] / R)
+            weights * torch.exp(-dist[i] / coverage_radius)
         )
-
+    
     dist_feat = dist_feat.unsqueeze(1)
-    dist_feat = dist_feat / (dist_feat.max() + 1e-6)
-
-    # ========= 4. 节点特征 =========
+    if dist_feat.max() > 0:
+        dist_feat = dist_feat / (dist_feat.max() + 1e-6)
+    
+    # ========= 5. 节点特征 =========
     node_feats = [points]
-
-    if instance.get('tourism_features') is not None:
-        node_feats.append(instance['tourism_features'])
-
+    
+    if 'tourism_features' in instance and instance['tourism_features'] is not None:
+        tourism_features = instance['tourism_features']
+        if not torch.is_tensor(tourism_features):
+            tourism_features = torch.tensor(tourism_features, dtype=torch.float).to(device)
+        else:
+            tourism_features = tourism_features.to(device)
+        node_feats.append(tourism_features)
+    
     node_feats.append(weights.unsqueeze(1))
-
+    
     x = torch.cat(node_feats, dim=1)
-
-    # ========= 5. 构建 PyG Data =========
+    
+    # ========= 6. 构建 PyG Data =========
     graph = pyg.data.Data(
         x=x,
         edge_index=edge_index,
@@ -428,13 +482,14 @@ def build_mclp_graph(instance):
         pos=points,
         degree=degree_norm,
         dist_row_sum=dist_feat,
-        distance_matrix=dist,
-        coverage_radius=R,
+        distance_matrix=dist,  # 保存计算的距离矩阵
+        coverage_radius=coverage_radius,
         total_weights=weights,
-        instance_name=instance['name'],
-        instance_id=instance['instance_id']
+        instance_name=instance.get('name', f'instance_{id(instance)}'),
+        instance_id=instance.get('instance_id', 0),
+        num_nodes=N
     )
-
+    
     return graph
 
 # ========== 数据集工具函数 ==========
