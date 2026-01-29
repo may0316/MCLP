@@ -5,7 +5,6 @@ import time
 import pickle
 from typing import Tuple, List, Optional, Dict, Any
 from sklearn.cluster import KMeans
-from load_real_data import load_osm_poi_data
 
 # ========== 距离计算函数 ==========
 def _get_distance_func(distance_metric: str):
@@ -361,11 +360,9 @@ class MCLPDatasetGenerator:
         
         return dataset
 
-# ========== 图构建函数（优化版） ==========
-# ========== 图构建函数（修复版） ==========
+# ========== 图构建函数 ==========
 def build_mclp_graph(instance, device=None):
     """
-    MCLP-aware 图构建（修复版）
     - 如果缺少 distance_matrix，自动计算
     - 更好的错误处理和兼容性
     """
