@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv
+from torch_geometric.nn import GATConv, GCNConv
 import torch_geometric
 import numpy as np
 import pandas as pd
@@ -11,6 +11,7 @@ import os
 import time
 import matplotlib.pyplot as plt
 from typing import Tuple, List, Optional
+from sklearn.cluster import KMeans
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -149,52 +150,79 @@ def build_tourism_mclp_graph(demand_points, facility_candidates, demand_weights,
     return graph
 
 
-# ========== 从真实数据创建数据集 ==========
-def create_tourism_dataset_from_csv(csv_path, num_instances=20,
-                                   service_radius=0.05,  # 约5.5公里（经纬度单位）
-                                   n_facility_candidates=50,
-                                   facility_ratio=0.3):  # 设施候选点数量 = 需求点数量 * facility_ratio
+# ========== 改进的数据集创建 ==========
+def create_improved_tourism_dataset(csv_path, num_instances=20,
+                                    service_radius=0.1,  # 服务半径
+                                    n_facility_candidates=100,  # 候选点数量
+                                    facility_ratio=0.5):  # 设施候选点比例
     """
-    从CSV创建文旅MCLP数据集（分离需求点和设施点）
-
-    根据论文中的方法：
-    - 需求点：从POI中采样
-    - 设施点：从POI中随机选择（模拟建筑/可用场地）
-    - 需求量：使用CSV中的demand列
+    改进的数据集创建
     """
     df = pd.read_csv(csv_path)
     print(f"原始数据: {len(df)} 个点位")
 
+    # 分析数据分布
+    coords = df[['x', 'y']].values
+    print(f"坐标范围: X[{coords[:, 0].min():.4f}, {coords[:, 0].max():.4f}], "
+          f"Y[{coords[:, 1].min():.4f}, {coords[:, 1].max():.4f}]")
+
+    # 计算实际距离范围
+    x_range = coords[:, 0].max() - coords[:, 0].min()
+    y_range = coords[:, 1].max() - coords[:, 1].min()
+    print(f"实际范围: 经度差={x_range:.4f}° (~{x_range * 111:.1f}km), "
+          f"纬度差={y_range:.4f}° (~{y_range * 111:.1f}km)")
+
     dataset = []
 
     for i in range(num_instances):
-        # 随机采样80%作为需求点
-        sampled_df = df.sample(frac=0.8, random_state=42 + i)
+        # 使用不同的随机种子
+        seed = 42 + i * 10
+        np.random.seed(seed)
+
+        # 随机采样70-90%作为需求点
+        sample_ratio = np.random.uniform(0.7, 0.9)
+        sampled_df = df.sample(frac=sample_ratio, random_state=seed)
+
         demand_points = sampled_df[['x', 'y']].values
         demand_weights = sampled_df['demand'].values
 
-        # 归一化坐标（重要：使距离计算合理）
+        # 归一化坐标
         center = demand_points.mean(axis=0)
-        scale = demand_points.std(axis=0).max()
-        demand_points_norm = (demand_points - center) / (scale + 1e-8)
+        scale = max(demand_points.std(axis=0).max(), 0.1)
+        demand_points_norm = (demand_points - center) / scale
 
-        # 从所有点中随机选择设施候选点
-        # 设施点数量 = 需求点数量 * facility_ratio
-        n_facility = max(10, int(len(demand_points) * facility_ratio))
-        facility_indices = np.random.choice(len(df), n_facility, replace=False)
-        facility_points = df.iloc[facility_indices][['x', 'y']].values
-        facility_points_norm = (facility_points - center) / (scale + 1e-8)
+        # 设施候选点：包括从所有点中随机选择 + 聚类中心
+        n_facility = max(20, int(len(demand_points) * facility_ratio))
 
-        # 生成场景标签（用于特征）
+        # 方法1：随机选择
+        random_indices = np.random.choice(len(df), min(n_facility // 2, len(df)), replace=False)
+        random_facilities = df.iloc[random_indices][['x', 'y']].values
+
+        # 方法2：KMeans聚类中心
+        if len(demand_points) > n_facility // 2:
+            kmeans = KMeans(n_clusters=n_facility // 2, random_state=seed, n_init=10)
+            kmeans.fit(demand_points)
+            cluster_centers = kmeans.cluster_centers_
+        else:
+            cluster_centers = demand_points[np.random.choice(len(demand_points),
+                                                             n_facility // 2, replace=True)]
+
+        # 合并设施候选点
+        facility_points = np.vstack([random_facilities, cluster_centers])
+        facility_points_norm = (facility_points - center) / scale
+
+        # 生成场景标签
         scenic_labels = []
         for t in sampled_df['type']:
             type_str = str(t)
-            if '风景名胜' in type_str or '风景区' in type_str or '公园' in type_str:
-                scenic_labels.append(1.0)  # 高需求区域
+            if '风景名胜' in type_str or '公园' in type_str:
+                scenic_labels.append(1.0)
             elif '度假' in type_str or '休闲' in type_str:
-                scenic_labels.append(0.5)  # 中等需求区域
+                scenic_labels.append(0.8)
+            elif '博物馆' in type_str or '纪念馆' in type_str:
+                scenic_labels.append(0.6)
             else:
-                scenic_labels.append(0.0)  # 一般区域
+                scenic_labels.append(0.3)
         scenic_labels = np.array(scenic_labels)
 
         instance = {
@@ -202,7 +230,7 @@ def create_tourism_dataset_from_csv(csv_path, num_instances=20,
             'instance_id': i,
             'demand_points': demand_points_norm,
             'facility_candidates': facility_points_norm,
-            'demand_weights': demand_weights,
+            'demand_weights': demand_weights / demand_weights.max(),  # 归一化需求权重
             'scenic_labels': scenic_labels,
             'service_radius': service_radius,
             'n_demand': len(demand_points),
@@ -217,17 +245,17 @@ def create_tourism_dataset_from_csv(csv_path, num_instances=20,
     return dataset
 
 
-# ========== 文旅MCLP编码器 ==========
-class TourismMCLPEncoder(nn.Module):
-    """文旅MCLP编码器（处理需求点和设施点的二分图）"""
+# ========== 改进的MCLP模型 ==========
+class ImprovedTourismMCLPEncoder(nn.Module):
+    """改进的文旅MCLP编码器"""
 
-    def __init__(self, in_channels, hidden_channels=256, out_channels=128, dropout=0.2):
+    def __init__(self, in_channels, hidden_channels=256, out_channels=128, dropout=0.1):
         super().__init__()
 
-        # 使用GAT处理异构图
-        self.conv1 = GATConv(in_channels, hidden_channels // 4, heads=4, concat=True)
-        self.conv2 = GATConv(hidden_channels, hidden_channels // 4, heads=4, concat=True)
-        self.conv3 = GATConv(hidden_channels, out_channels, heads=1, concat=False)
+        # 使用GCN和GAT的组合
+        self.gcn1 = GCNConv(in_channels, hidden_channels)
+        self.gat1 = GATConv(hidden_channels, hidden_channels // 4, heads=4, concat=True)
+        self.gat2 = GATConv(hidden_channels, out_channels, heads=1, concat=False)
 
         self.bn1 = nn.BatchNorm1d(hidden_channels)
         self.bn2 = nn.BatchNorm1d(hidden_channels)
@@ -235,37 +263,48 @@ class TourismMCLPEncoder(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
+        # 注意力机制
+        self.attention = nn.MultiheadAttention(out_channels, num_heads=4, batch_first=True)
+
     def forward(self, x, edge_index):
-        h = self.conv1(x, edge_index)
+        # GCN层
+        h = self.gcn1(x, edge_index)
         h = F.relu(self.bn1(h))
         h = self.dropout(h)
 
-        h = self.conv2(h, edge_index)
+        # GAT层
+        h = self.gat1(h, edge_index)
         h = F.relu(self.bn2(h))
         h = self.dropout(h)
 
-        h = self.conv3(h, edge_index)
+        h = self.gat2(h, edge_index)
         h = F.relu(self.bn3(h))
+
+        # 自注意力（捕捉全局关系）
+        h = h.unsqueeze(0)  # [1, N, dim]
+        h, _ = self.attention(h, h, h)
+        h = h.squeeze(0)
 
         return h
 
 
-# ========== 文旅MCLP模型 ==========
-class TourismMCLPModel(nn.Module):
-    """文旅MCLP模型"""
+class ImprovedTourismMCLPModel(nn.Module):
+    """改进的文旅MCLP模型"""
 
     def __init__(self, input_dim, hidden_dim=256, output_dim=128):
         super().__init__()
 
-        self.encoder = TourismMCLPEncoder(input_dim, hidden_dim, output_dim)
+        self.encoder = ImprovedTourismMCLPEncoder(input_dim, hidden_dim, output_dim)
 
-        # 设施点选择头
+        # 设施点选择头（增强）
         self.facility_head = nn.Sequential(
             nn.Linear(output_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.BatchNorm1d(hidden_dim),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
+            nn.BatchNorm1d(hidden_dim // 2),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim // 2, 1)
         )
@@ -274,6 +313,7 @@ class TourismMCLPModel(nn.Module):
         self.coverage_head = nn.Sequential(
             nn.Linear(output_dim, hidden_dim // 2),
             nn.ReLU(),
+            nn.BatchNorm1d(hidden_dim // 2),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim // 2, 1),
             nn.Sigmoid()
@@ -283,7 +323,15 @@ class TourismMCLPModel(nn.Module):
         self.value_head = nn.Sequential(
             nn.Linear(output_dim, hidden_dim // 2),
             nn.ReLU(),
+            nn.BatchNorm1d(hidden_dim // 2),
             nn.Linear(hidden_dim // 2, 1)
+        )
+
+        # 区域聚类头（新增）
+        self.cluster_head = nn.Sequential(
+            nn.Linear(output_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 8)  # 最多8个聚类
         )
 
     def forward(self, graph):
@@ -292,20 +340,20 @@ class TourismMCLPModel(nn.Module):
 
         emb = self.encoder(x, edge_index)
 
-        # 分离需求点和设施点的嵌入
         demand_emb = emb[:graph.n_demand]
         facility_emb = emb[graph.n_demand:]
 
         facility_scores = self.facility_head(facility_emb).squeeze()
         coverage_pred = self.coverage_head(demand_emb).squeeze()
         value_pred = self.value_head(emb).squeeze()
+        cluster_logits = self.cluster_head(emb)
 
-        return demand_emb, facility_emb, facility_scores, coverage_pred, value_pred
+        return demand_emb, facility_emb, facility_scores, coverage_pred, value_pred, cluster_logits
 
 
-# ========== 文旅MCLP求解器 ==========
-class TourismMCLPSolver:
-    """文旅MCLP求解器"""
+# ========== 改进的求解器 ==========
+class ImprovedTourismMCLPSolver:
+    """改进的文旅MCLP求解器"""
 
     def __init__(self, device='cpu'):
         self.device = torch.device(device)
@@ -314,90 +362,125 @@ class TourismMCLPSolver:
         self.scheduler = None
 
     def initialize_model(self, input_dim, hidden_dim=256, output_dim=128):
-        """初始化模型"""
-        self.model = TourismMCLPModel(input_dim, hidden_dim, output_dim).to(self.device)
+        self.model = ImprovedTourismMCLPModel(input_dim, hidden_dim, output_dim).to(self.device)
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
-            lr=5e-4,
-            weight_decay=1e-5,
+            lr=3e-4,
+            weight_decay=1e-4,
             betas=(0.9, 0.999)
         )
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer, T_0=10, T_mult=2, eta_min=1e-6
+        # 移除verbose参数
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=5
         )
-        print(f"文旅MCLP模型初始化: 输入维度={input_dim}")
+        print(f"改进的文旅MCLP模型初始化: 输入维度={input_dim}")
         return self.model
 
-    def tourism_mclp_loss(self, facility_scores, coverage_pred, value_pred, graph, K, alpha=0.3, beta=0.1):
-        """文旅MCLP损失函数（自监督）"""
+    def improved_loss(self, facility_scores, coverage_pred, value_pred, cluster_logits,
+                      graph, K, alpha=0.2, beta=0.1, gamma=0.05):
+        """改进的损失函数"""
         coverage_matrix = graph.coverage_matrix
         demand_weights = graph.demand_weights
 
         n_facility = graph.n_facility
+        n_demand = graph.n_demand
 
-        # 使用Gumbel-Softmax进行可微选择
-        temperature = max(0.2, 1.0 - 0.5 * (K / n_facility))
-        p = F.gumbel_softmax(facility_scores.unsqueeze(0), tau=temperature, hard=False, dim=1).squeeze()
-        p = p * K
+        # 1. 主目标：加权覆盖
+        # 使用Softmax + Top-k近似
+        temperature = max(0.1, 1.0 - 0.8 * (K / n_facility))
+        facility_probs = F.softmax(facility_scores / temperature, dim=0)
 
-        # 计算覆盖概率
-        facility_probs = p.unsqueeze(0)  # [1, n_facility]
-        covered_prob = torch.max(facility_probs * coverage_matrix, dim=1)[0]
+        # 期望覆盖
+        covered_prob = torch.zeros(n_demand, device=self.device)
+        for j in range(n_facility):
+            covered_prob += facility_probs[j] * K * coverage_matrix[:, j]
+
         covered_prob = torch.clamp(covered_prob, 0, 1)
 
-        # 主目标：加权覆盖
         weighted_coverage = torch.sum(demand_weights * covered_prob)
         total_demand = torch.sum(demand_weights)
-        coverage_loss = -weighted_coverage / (total_demand + 1e-8)
+        coverage_loss = -torch.log(weighted_coverage / (total_demand + 1e-8) + 1e-8)
 
-        # 设施数量约束
-        facility_count_loss = (p.sum() - K) ** 2 * 0.05
+        # 2. 设施数量约束（使用熵正则化）
+        facility_entropy = -torch.sum(facility_probs * torch.log(facility_probs + 1e-8))
+        entropy_loss = -facility_entropy * 0.01  # 鼓励多样性
 
-        # 辅助任务1：预测覆盖
+        # 3. 辅助任务：覆盖预测
         with torch.no_grad():
-            _, top_indices = torch.topk(facility_scores, min(K, n_facility))
-            selected_mask = torch.zeros(n_facility, device=self.device)
-            selected_mask[top_indices] = 1.0
-            coverage_target = (torch.max(selected_mask.unsqueeze(0) * coverage_matrix, dim=1)[0] > 0).float()
+            # 使用贪心选择
+            selected = self._greedy_selection(graph, facility_scores, K)
+            coverage_target = torch.zeros(n_demand, device=self.device)
+            for idx in selected:
+                coverage_target = torch.max(coverage_target, coverage_matrix[:, idx])
 
         aux_loss1 = F.binary_cross_entropy(coverage_pred, coverage_target)
 
-        # 辅助任务2：预测价值
+        # 4. 辅助任务：价值预测
         with torch.no_grad():
             value_target = torch.zeros(len(value_pred), device=self.device)
-            # 需求点的价值 = 其需求权重
-            value_target[:graph.n_demand] = demand_weights / (total_demand + 1e-8)
-            # 设施点的价值 = 其覆盖的需求权重
+            value_target[:n_demand] = demand_weights / (total_demand + 1e-8)
+
+            # 简化版Shapley值近似
             for j in range(n_facility):
-                covered = coverage_matrix[:, j] > 0
-                if covered.any():
-                    value_target[graph.n_demand + j] = demand_weights[covered].sum() / (total_demand + 1e-8)
+                # 计算边际贡献的近似
+                base_coverage = torch.zeros(n_demand, device=self.device)
+                for idx in selected:
+                    base_coverage = torch.max(base_coverage, coverage_matrix[:, idx])
+
+                with_j = torch.max(base_coverage, coverage_matrix[:, j])
+                marginal = torch.sum(demand_weights * (with_j - base_coverage)).item()
+                value_target[n_demand + j] = max(0, marginal) / (total_demand + 1e-8)
 
         aux_loss2 = F.mse_loss(value_pred, value_target)
 
-        # 分散度奖励（避免设施过于集中）
-        if len(top_indices) > 1:
-            facility_pos = graph.facility_pos
-            selected_pos = facility_pos[top_indices]
+        # 5. 聚类损失（鼓励区域多样性）
+        cluster_loss = 0
+        if n_demand > 10:
+            try:
+                # 使用KMeans得到伪标签
+                with torch.no_grad():
+                    from sklearn.cluster import KMeans
+                    demand_pos_np = graph.demand_pos.cpu().numpy()
+                    kmeans = KMeans(n_clusters=min(8, n_demand // 10), random_state=42, n_init=10)
+                    cluster_labels = kmeans.fit_predict(demand_pos_np)
+                    cluster_labels = torch.tensor(cluster_labels, device=self.device)
 
-            pairwise_dist = torch.cdist(selected_pos, selected_pos)
-            mask = 1 - torch.eye(len(selected_pos), device=self.device)
-            avg_dist = (pairwise_dist * mask).sum() / (len(selected_pos) * (len(selected_pos) - 1) + 1e-8)
+                cluster_loss = F.cross_entropy(cluster_logits[:n_demand], cluster_labels)
+            except:
+                cluster_loss = 0
 
-            # 奖励大的平均距离
-            dispersion_reward = -beta * (graph.service_radius * 2) / (avg_dist + 1e-8)
-        else:
-            dispersion_reward = 0
+        # 6. 分散度奖励
+        with torch.no_grad():
+            _, top_indices = torch.topk(facility_scores, min(K, n_facility))
+            if len(top_indices) > 1:
+                facility_pos = graph.facility_pos
+                selected_pos = facility_pos[top_indices]
+                pairwise_dist = torch.cdist(selected_pos, selected_pos)
+                mask = 1 - torch.eye(len(selected_pos), device=self.device)
+                avg_dist = (pairwise_dist * mask).sum() / (len(selected_pos) * (len(selected_pos) - 1) + 1e-8)
+                dispersion_reward = beta * avg_dist / (graph.service_radius * 2 + 1e-8)
+            else:
+                dispersion_reward = 0
 
-        total_loss = (coverage_loss +
-                      facility_count_loss +
+        total_loss = (coverage_loss + entropy_loss +
                       alpha * (aux_loss1 + aux_loss2) +
+                      gamma * cluster_loss -
                       dispersion_reward)
 
         return total_loss, weighted_coverage.item()
 
+    def _calculate_coverage_by_indices(self, graph, indices):
+        """根据索引计算覆盖"""
+        if len(indices) == 0:
+            return 0.0
+        coverage_matrix = graph.coverage_matrix
+        demand_weights = graph.demand_weights
+        covered = torch.zeros(graph.n_demand, dtype=torch.bool, device=self.device)
+        for idx in indices:
+            covered = covered | (coverage_matrix[:, idx] > 0)
+        return torch.sum(demand_weights[covered]).item()
+
     def train_on_instance(self, graph, K, epochs=20):
-        """在单个实例上训练"""
         self.model.train()
         graph = graph.to(self.device)
 
@@ -406,21 +489,29 @@ class TourismMCLPSolver:
         for epoch in range(epochs):
             self.optimizer.zero_grad()
 
-            _, _, facility_scores, coverage_pred, value_pred = self.model(graph)
-            loss, coverage = self.tourism_mclp_loss(facility_scores, coverage_pred, value_pred, graph, K)
+            (_, _, facility_scores,
+             coverage_pred, value_pred,
+             cluster_logits) = self.model(graph)
+
+            loss, coverage = self.improved_loss(
+                facility_scores, coverage_pred, value_pred, cluster_logits,
+                graph, K
+            )
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
-            self.scheduler.step()
 
             losses.append(loss.item())
+
+        if self.scheduler is not None:
+            self.scheduler.step(np.mean(losses))
 
         return losses
 
     @torch.no_grad()
-    def solve(self, graph, K, num_trials=10):
-        """求解MCLP问题"""
+    def solve(self, graph, K, num_trials=20):
+        """改进的求解算法"""
         self.model.eval()
         graph = graph.to(self.device)
 
@@ -431,80 +522,143 @@ class TourismMCLPSolver:
         best_coverage = 0
         best_selection = None
 
+        # 确保K不超过设施点数量
+        K = min(K, n_facility)
+
         for trial in range(num_trials):
-            _, _, facility_scores, _, _ = self.model(graph)
+            _, _, facility_scores, _, _, _ = self.model(graph)
 
-            # 添加噪声进行探索
-            noise_scale = 0.1 * (1 - trial / num_trials)
-            if trial > 0:
-                noise = torch.randn_like(facility_scores) * noise_scale
-                scores = facility_scores + noise
-            else:
-                scores = facility_scores
+            # 策略1：贪心选择（基础）
+            selected1 = self._greedy_selection(graph, facility_scores, K)
+            coverage1 = self._calculate_coverage(graph, selected1)
 
-            # 贪心选择
-            selected = []
-            covered = torch.zeros(graph.n_demand, dtype=torch.bool, device=self.device)
+            # 策略2：带噪声的贪心
+            noise = torch.randn_like(facility_scores) * 0.1
+            selected2 = self._greedy_selection(graph, facility_scores + noise, K)
+            coverage2 = self._calculate_coverage(graph, selected2)
 
-            # 按得分排序后贪心
-            sorted_indices = torch.argsort(scores, descending=True)
+            # 策略3：Top-K
+            _, top_indices = torch.topk(facility_scores, K)
+            selected3 = top_indices
+            coverage3 = self._calculate_coverage(graph, selected3)
 
-            for idx in sorted_indices:
-                if len(selected) >= K:
-                    break
+            # 策略4：聚类辅助选择
+            selected4 = None
+            coverage4 = 0
+            if n_facility > K * 2:
+                try:
+                    from sklearn.cluster import KMeans
+                    facility_pos = graph.facility_pos.cpu().numpy()
+                    kmeans = KMeans(n_clusters=K, random_state=trial, n_init=10)
+                    cluster_labels = kmeans.fit_predict(facility_pos)
 
-                newly_covered = (coverage_matrix[:, idx] > 0) & (~covered)
-                if newly_covered.any() or len(selected) < K:
-                    selected.append(idx.item())
-                    covered = covered | (coverage_matrix[:, idx] > 0)
+                    selected4_list = []
+                    facility_scores_np = facility_scores.cpu().numpy()
+                    for c in range(K):
+                        cluster_indices = np.where(cluster_labels == c)[0]
+                        if len(cluster_indices) > 0:
+                            best_in_cluster = cluster_indices[np.argmax(facility_scores_np[cluster_indices])]
+                            selected4_list.append(best_in_cluster)
+                    if len(selected4_list) == K:
+                        selected4 = torch.tensor(selected4_list, device=self.device)
+                        coverage4 = self._calculate_coverage(graph, selected4)
+                except:
+                    pass
 
-            # 如果还不够，补全
-            if len(selected) < K:
-                for idx in range(n_facility):
-                    if idx not in selected and len(selected) < K:
-                        selected.append(idx)
+            # 记录最佳
+            candidates = [(coverage1, selected1), (coverage2, selected2), (coverage3, selected3)]
+            if selected4 is not None:
+                candidates.append((coverage4, selected4))
 
-            selected_tensor = torch.tensor(selected, device=self.device)
-
-            # 计算覆盖
-            covered_mask = torch.zeros(graph.n_demand, dtype=torch.bool, device=self.device)
-            for idx in selected:
-                covered_mask = covered_mask | (coverage_matrix[:, idx] > 0)
-            coverage = torch.sum(demand_weights[covered_mask]).item()
-
-            if coverage > best_coverage:
-                best_coverage = coverage
-                best_selection = selected_tensor
+            for cov, sel in candidates:
+                if cov > best_coverage:
+                    best_coverage = cov
+                    best_selection = sel
 
         return best_selection, best_coverage
 
-    def save_model(self, path='tourism_mclp_model.pth'):
+    def _greedy_selection(self, graph, scores, K):
+        """贪心选择（带边际增益）"""
+        coverage_matrix = graph.coverage_matrix
+        demand_weights = graph.demand_weights
+        n_facility = graph.n_facility
+
+        K = min(K, n_facility)
+
+        selected = []
+        covered = torch.zeros(graph.n_demand, dtype=torch.bool, device=self.device)
+
+        # 考虑边际增益
+        remaining = list(range(n_facility))
+
+        for _ in range(K):
+            best_gain = -1
+            best_node = -1
+
+            for node in remaining:
+                newly_covered = (coverage_matrix[:, node] > 0) & (~covered)
+                gain = torch.sum(demand_weights[newly_covered]).item()
+
+                # 结合模型得分
+                combined_gain = gain + 0.05 * scores[node].item()
+
+                if combined_gain > best_gain:
+                    best_gain = combined_gain
+                    best_node = node
+
+            if best_node != -1:
+                selected.append(best_node)
+                newly_covered = (coverage_matrix[:, best_node] > 0) & (~covered)
+                covered = covered | newly_covered
+                remaining.remove(best_node)
+
+        # 如果还不够，补全得分最高的
+        if len(selected) < K:
+            remaining_scores = [(i, scores[i].item()) for i in remaining]
+            remaining_scores.sort(key=lambda x: x[1], reverse=True)
+            for i, _ in remaining_scores[:K - len(selected)]:
+                selected.append(i)
+
+        return torch.tensor(selected, device=self.device)
+
+    def _calculate_coverage(self, graph, selected_indices):
+        """计算覆盖的总需求"""
+        if len(selected_indices) == 0:
+            return 0.0
+
+        coverage_matrix = graph.coverage_matrix
+        demand_weights = graph.demand_weights
+
+        covered = torch.zeros(graph.n_demand, dtype=torch.bool, device=self.device)
+        for idx in selected_indices:
+            covered = covered | (coverage_matrix[:, idx] > 0)
+
+        return torch.sum(demand_weights[covered]).item()
+
+    def save_model(self, path='improved_tourism_model.pth'):
         torch.save({
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None
         }, path)
         print(f"模型已保存: {path}")
 
-    def load_model(self, path='tourism_mclp_model.pth'):
+    def load_model(self, path='improved_tourism_model.pth'):
         if self.model is None:
             raise ValueError("请先初始化模型")
 
         if os.path.exists(path):
             checkpoint = torch.load(path, map_location=self.device)
             self.model.load_state_dict(checkpoint['model_state_dict'])
-            if 'optimizer_state_dict' in checkpoint:
-                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             print(f"模型已加载: {path}")
         else:
             print(f"模型文件不存在: {path}")
 
 
 # ========== 训练函数 ==========
-def train_tourism_model(dataset, val_ratio=0.2, K_range=[3, 5, 8, 10, 12, 15], epochs_per_instance=15):
-    """训练文旅MCLP模型"""
+def train_improved_model(dataset, val_ratio=0.2, K_range=[5, 8, 10, 12, 15, 20],
+                         epochs_per_instance=20):
+    """训练改进的文旅MCLP模型"""
 
-    # 划分训练集和验证集
     n_train = int(len(dataset) * (1 - val_ratio))
     train_dataset = dataset[:n_train]
     val_dataset = dataset[n_train:]
@@ -526,7 +680,7 @@ def train_tourism_model(dataset, val_ratio=0.2, K_range=[3, 5, 8, 10, 12, 15], e
     print(f"输入特征维度: {input_dim}")
 
     # 初始化求解器
-    solver = TourismMCLPSolver(device=device)
+    solver = ImprovedTourismMCLPSolver(device=device)
     solver.initialize_model(input_dim=input_dim, hidden_dim=256, output_dim=128)
 
     print(f"\n开始训练...")
@@ -547,22 +701,28 @@ def train_tourism_model(dataset, val_ratio=0.2, K_range=[3, 5, 8, 10, 12, 15], e
             device=device
         )
 
-        # 动态选择K值
+        # 根据实例规模动态选择K
+        n_demand = instance['n_demand']
+        n_facility = instance['n_facility']
+        suggested_K = min(max(5, n_demand // 20), n_facility // 2)
+
+        available_K = [k for k in K_range if k <= suggested_K]
+        if len(available_K) == 0:
+            available_K = [min(suggested_K, 5)]
+
         if epoch < len(train_dataset) // 3:
-            K = np.random.choice(K_range[:3])
-        elif epoch < 2 * len(train_dataset) // 3:
-            K = np.random.choice(K_range[2:5])
+            K = np.random.choice(available_K)
         else:
-            K = np.random.choice(K_range[3:])
+            K = np.random.choice([k for k in K_range if k <= n_facility])
 
         # 训练
         losses = solver.train_on_instance(graph, K=K, epochs=epochs_per_instance)
         all_losses.extend(losses)
 
-        # 定期验证
+        # 验证
         if (epoch + 1) % 5 == 0 and len(val_dataset) > 0:
             val_coverages = []
-            for val_instance in val_dataset[:2]:
+            for val_instance in val_dataset[:3]:
                 val_graph = build_tourism_mclp_graph(
                     val_instance['demand_points'],
                     val_instance['facility_candidates'],
@@ -571,7 +731,7 @@ def train_tourism_model(dataset, val_ratio=0.2, K_range=[3, 5, 8, 10, 12, 15], e
                     val_instance.get('scenic_labels'),
                     device=device
                 )
-                _, val_coverage = solver.solve(val_graph, K=8, num_trials=3)
+                _, val_coverage = solver.solve(val_graph, K=10, num_trials=5)
                 total_demand = torch.sum(val_graph.demand_weights).item()
                 val_pct = (val_coverage / total_demand) * 100
                 val_coverages.append(val_pct)
@@ -581,137 +741,43 @@ def train_tourism_model(dataset, val_ratio=0.2, K_range=[3, 5, 8, 10, 12, 15], e
 
             if avg_val_coverage > best_val_coverage:
                 best_val_coverage = avg_val_coverage
-                solver.save_model('best_tourism_model.pth')
+                solver.save_model('best_improved_model.pth')
                 print(f"  → 保存最佳模型 (覆盖率: {avg_val_coverage:.1f}%)")
 
-        # 打印进度
         if (epoch + 1) % 10 == 0:
-            avg_loss = np.mean(all_losses[-10:]) if len(all_losses) >= 10 else np.mean(all_losses)
+            avg_loss = np.mean(all_losses[-20:]) if len(all_losses) >= 20 else np.mean(all_losses)
             print(f"Epoch {epoch + 1}/{len(train_dataset)} | 平均损失: {avg_loss:.4f}")
 
     print(f"\n训练完成！最佳验证覆盖率: {best_val_coverage:.1f}%")
-    solver.save_model('final_tourism_model.pth')
+    solver.save_model('final_improved_model.pth')
 
     return solver
-
-
-# ========== 测试函数 ==========
-def test_tourism_model(solver, test_instances, K_values=[3, 5, 8, 10, 12, 15]):
-    """测试模型"""
-    print("\n" + "=" * 50)
-    print("文旅MCLP模型测试")
-    print("=" * 50)
-
-    results = {}
-
-    for K in K_values:
-        results[K] = []
-
-    for i, instance in enumerate(test_instances[:5]):  # 测试前5个实例
-        graph = build_tourism_mclp_graph(
-            instance['demand_points'],
-            instance['facility_candidates'],
-            instance['demand_weights'],
-            instance['service_radius'],
-            instance.get('scenic_labels'),
-            device=device
-        )
-        total_demand = torch.sum(graph.demand_weights).item()
-
-        print(f"\n测试实例 {i + 1}: {instance['name']}, 需求点={instance['n_demand']}, 设施候选={instance['n_facility']}")
-
-        for K in K_values:
-            selected, coverage = solver.solve(graph, K=K, num_trials=8)
-            coverage_pct = (coverage / total_demand) * 100
-            results[K].append(coverage_pct)
-            print(f"  K={K:2d}: 覆盖率={coverage_pct:5.1f}%")
-
-    print("\n" + "-" * 50)
-    print("各K值平均覆盖率:")
-    for K in K_values:
-        avg = np.mean(results[K])
-        print(f"K={K:2d}: {avg:5.1f}%")
-
-    overall_avg = np.mean([c for covs in results.values() for c in covs])
-    print(f"\n总体平均覆盖率: {overall_avg:.1f}%")
-
-    return results
-
-
-# ========== 可视化函数 ==========
-def visualize_tourism_solution(graph, selected_indices, K, coverage, save_path=None):
-    """可视化文旅MCLP求解结果"""
-    demand_points = graph.demand_pos.cpu().numpy()
-    facility_points = graph.facility_pos.cpu().numpy()
-    selected = selected_indices.cpu().numpy()
-    demand_weights = graph.demand_weights.cpu().numpy()
-
-    plt.figure(figsize=(14, 10))
-
-    # 绘制需求点（颜色表示需求权重）
-    scatter = plt.scatter(demand_points[:, 0], demand_points[:, 1],
-                          c=demand_weights, cmap='YlOrRd', s=50, alpha=0.7,
-                          label='Demand Points')
-    plt.colorbar(scatter, label='Demand Weight')
-
-    # 绘制所有候选设施点
-    plt.scatter(facility_points[:, 0], facility_points[:, 1],
-                c='lightblue', s=80, marker='s', alpha=0.5,
-                label='Candidate Facilities')
-
-    # 绘制选中的设施点
-    plt.scatter(facility_points[selected, 0], facility_points[selected, 1],
-                c='red', s=200, marker='*', edgecolors='black', linewidths=2,
-                label=f'Selected Facilities (K={K})')
-
-    # 绘制服务半径（只画前5个，避免太乱）
-    R = graph.service_radius
-    for i, idx in enumerate(selected[:min(5, len(selected))]):
-        circle = plt.Circle(facility_points[idx], R, color='red',
-                            fill=False, linestyle='--', alpha=0.3, linewidth=1.5)
-        plt.gca().add_patch(circle)
-
-    total_demand = torch.sum(graph.demand_weights).item()
-    coverage_pct = (coverage / total_demand) * 100
-
-    plt.title(f'Tourism MCLP Solution - Coverage: {coverage:.1f} ({coverage_pct:.1f}%)', fontsize=14)
-    plt.xlabel('X (normalized)', fontsize=12)
-    plt.ylabel('Y (normalized)', fontsize=12)
-    plt.legend(fontsize=10)
-    plt.grid(True, alpha=0.3)
-    plt.axis('equal')
-
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.show()
 
 
 # ========== 主函数 ==========
 def main():
     print("=" * 60)
-    print("文旅场景MCLP模型训练与测试")
+    print("改进的文旅场景MCLP模型")
     print("=" * 60)
 
-    # 检查数据文件
     csv_path = 'tourism_poi_beijing.csv'
 
     if not os.path.exists(csv_path):
         print(f"错误: 数据文件 {csv_path} 不存在!")
-        print("请确保 tourism_poi_beijing.csv 在当前目录下")
         return
 
-    # 创建数据集
-    print("\n从真实数据创建文旅MCLP数据集...")
-    dataset = create_tourism_dataset_from_csv(
+    # 创建改进的数据集
+    print("\n创建改进的文旅MCLP数据集...")
+    dataset = create_improved_tourism_dataset(
         csv_path=csv_path,
-        num_instances=30,  # 创建30个实例
-        service_radius=0.05,  # 服务半径（归一化后约对应5.5公里）
-        n_facility_candidates=40,  # 每个实例的设施候选点数量
-        facility_ratio=0.3  # 设施候选点数量 = 需求点数量 * 0.3
+        num_instances=30,
+        service_radius=0.1,  # 增大到0.15（约16.5公里）
+        n_facility_candidates=120,
+        facility_ratio=0.6
     )
 
     print(f"\n数据集大小: {len(dataset)} 个实例")
-    print(f"每个实例: 需求点 ~{dataset[0]['n_demand']}, 设施候选 ~{dataset[0]['n_facility']}")
+    print(f"示例实例: 需求点={dataset[0]['n_demand']}, 设施候选={dataset[0]['n_facility']}")
 
     # 划分训练集和测试集
     train_size = int(len(dataset) * 0.7)
@@ -722,29 +788,49 @@ def main():
     print(f"测试集: {len(test_dataset)} 个实例")
 
     # 训练模型
-    solver = train_tourism_model(
+    solver = train_improved_model(
         train_dataset,
         val_ratio=0.2,
-        K_range=[3, 5, 8, 10, 12, 15],
-        epochs_per_instance=15
+        K_range=[5, 8, 10, 12, 15, 20, 25],
+        epochs_per_instance=20
     )
 
     # 测试模型
-    test_tourism_model(solver, test_dataset, K_values=[3, 5, 8, 10, 12, 15])
+    print("\n" + "=" * 50)
+    print("改进模型测试")
+    print("=" * 50)
 
-    # 可视化一个结果
-    print("\n可视化求解结果...")
-    full_instance = dataset[0]  # 用第一个实例
-    full_graph = build_tourism_mclp_graph(
-        full_instance['demand_points'],
-        full_instance['facility_candidates'],
-        full_instance['demand_weights'],
-        full_instance['service_radius'],
-        full_instance.get('scenic_labels'),
-        device=device
-    )
-    selected, coverage = solver.solve(full_graph, K=10, num_trials=10)
-    visualize_tourism_solution(full_graph, selected, 10, coverage, save_path='tourism_solution.png')
+    results = {}
+    for K in [5, 10, 15, 20, 25]:
+        results[K] = []
+
+    for i, instance in enumerate(test_dataset[:5]):
+        graph = build_tourism_mclp_graph(
+            instance['demand_points'],
+            instance['facility_candidates'],
+            instance['demand_weights'],
+            instance['service_radius'],
+            instance.get('scenic_labels'),
+            device=device
+        )
+        total_demand = torch.sum(graph.demand_weights).item()
+
+        print(f"\n测试实例 {i + 1}: 需求点={instance['n_demand']}, 设施候选={instance['n_facility']}")
+
+        for K in [5, 10, 15, 20, 25]:
+            selected, coverage = solver.solve(graph, K=min(K, instance['n_facility']), num_trials=10)
+            coverage_pct = (coverage / total_demand) * 100
+            results[K].append(coverage_pct)
+            print(f"  K={K:2d}: 覆盖率={coverage_pct:5.1f}%")
+
+    print("\n" + "-" * 50)
+    print("各K值平均覆盖率:")
+    for K in [5, 10, 15, 20, 25]:
+        avg = np.mean(results[K])
+        print(f"K={K:2d}: {avg:5.1f}%")
+
+    overall_avg = np.mean([c for covs in results.values() for c in covs])
+    print(f"\n总体平均覆盖率: {overall_avg:.1f}%")
 
 
 if __name__ == "__main__":
