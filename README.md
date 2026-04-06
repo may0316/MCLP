@@ -1,7 +1,7 @@
 # 生成 n=20, p=4, radius=0.3 的数据
-python sponet_gen_data.py --graph_size 20 --p 4 --radius 0.3 --dataset_size 10000
-python sponet_gen_data.py --graph_size 50 --p 8 --radius 0.2 --dataset_size 10000
-python sponet_gen_data.py --graph_size 100 --p 15 --radius 0.15 --dataset_size 10000
+python sponet_gen_data.py --graph_size 20 --p 4 --radius 0.3 --dataset_size 100
+python sponet_gen_data.py --graph_size 50 --p 8 --radius 0.2 --dataset_size 100
+python sponet_gen_data.py --graph_size 100 --p 15 --radius 0.15 --dataset_size 100
 
 # 预训练对应规模的模型
 python pre_FLP.py 20 4 0.3
